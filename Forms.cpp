@@ -63,6 +63,23 @@ bool FormManager::fetchFromServer() {
     formMaxDaily.assign(formCount, 1);
     formHtmlOffsets.assign(formCount, 0);
 
+    Logger.add("Очистка памяти перед загрузкой...");
+    File root = LittleFS.open("/");
+    if (root) {
+        File file = root.openNextFile();
+        while (file) {
+            String fName = file.name();
+            file.close();
+            if (!fName.startsWith("/")) fName = "/" + fName;
+            if (fName.startsWith("/raw_")) {
+                LittleFS.remove(fName);
+            }
+            esp_task_wdt_reset();
+            file = root.openNextFile();
+        }
+        root.close();
+    }
+
     int loadedCount = 0;
     for (int i = 0; i < formCount; i++) {
         esp_task_wdt_reset();
