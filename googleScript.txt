@@ -1,0 +1,173 @@
+var FORMS_CONFIG = [
+  { 
+    formId: '16HPWAVadf86HR7Isogu8q7Y3BYehowdiaprIWCegp3Y', 
+    maxDaily: 1, 
+    title: 'Утро (Morning)' // Твое вшитое название
+  }, 
+  { 
+    formId: '1Xy3aeWQzcG951IXkfysJDt0W5IqIJymLhi1B2M97Dyw', 
+    maxDaily: 2, 
+    title: 'Пост-тренировочный (post-training)' // ЗАМЕНИ НА СВОЕ!
+  }   
+];
+
+// Умная проверка: обязателен ли вопрос
+function getReqAttr(item, type) {
+  try {
+    if (type == FormApp.ItemType.LIST) return item.asListItem().isRequired();
+    if (type == FormApp.ItemType.MULTIPLE_CHOICE) return item.asMultipleChoiceItem().isRequired();
+    if (type == FormApp.ItemType.SCALE) return item.asScaleItem().isRequired();
+    if (type == FormApp.ItemType.PARAGRAPH_TEXT) return item.asParagraphTextItem().isRequired();
+    if (type == FormApp.ItemType.TEXT) return item.asTextItem().isRequired();
+  } catch(e) {}
+  return false;
+}
+
+function doGet(e) {
+  if (!e || !e.parameter || !e.parameter.action) {
+    return ContentService.createTextOutput("✅ Скрипт работает идеально!").setMimeType(ContentService.MimeType.TEXT);
+  }
+  
+  var action = e.parameter.action.toLowerCase().trim();
+  
+  if (action === "getformcount") {
+    return ContentService.createTextOutput(FORMS_CONFIG.length.toString()).setMimeType(ContentService.MimeType.TEXT);
+  }
+  
+  if (action === "getform") {
+    var idx = parseInt(e.parameter.index);
+    if (isNaN(idx) || idx >= FORMS_CONFIG.length) return ContentService.createTextOutput("ERROR_INDEX").setMimeType(ContentService.MimeType.TEXT);
+    
+    var config = FORMS_CONFIG[idx];
+    var form = FormApp.openById(config.formId);
+    
+    // --- БРОНЕБОЙНОЕ ПОЛУЧЕНИЕ ЗАГОЛОВКА ---
+    // 1. Берем из наших настроек (приоритет)
+    var title = config.title;
+    // 2. Если в настройках пусто, пробуем достать из формы
+    if (!title || title.trim() === "") {
+      title = form.getTitle().replace(/\r?\n/g, " ").trim(); 
+    }
+    // 3. Если и там пусто, ставим резервное имя
+    if (!title || title.trim() === "") {
+      title = "Опросник " + (idx + 1);
+    }
+    
+    var maxDaily = config.maxDaily.toString(); 
+    var items = form.getItems();
+    var html = "";
+    
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      var rawTitle = item.getTitle();
+      var type = item.getType();
+      
+      // Игнорируем разделы, чтобы они не ломали форму
+      if (type == FormApp.ItemType.PAGE_BREAK) continue;
+      
+      // Защита от пустых заголовков в вопросах
+      if (rawTitle) {
+        var testTitle = rawTitle.toLowerCase().trim();
+        if (testTitle === "токен" || testTitle === "token" || testTitle === "form_id" || testTitle === "form_index") continue;
+      }
+      
+      if (type == FormApp.ItemType.IMAGE) {
+        try {
+          var imageItem = item.asImageItem();
+          var blob = imageItem.getImage();
+          if (blob) {
+            // Убираем ЛЮБЫЕ переносы строк из картинки
+            var base64Data = Utilities.base64Encode(blob.getBytes()).replace(/\r?\n/g, "");
+            var mimeType = blob.getContentType();
+            html += "<div style='text-align:center; margin:20px 0;'>";
+            if (rawTitle) html += "<p style='font-weight:bold; margin-bottom:8px; white-space: pre-wrap;'>" + rawTitle.replace(/\n/g, "<br>") + "</p>";
+            html += "<img src='data:" + mimeType + ";base64," + base64Data + "' style='max-width:100%; height:auto; border-radius:12px; box-shadow:0 4px 12px rgba(0,0,0,0.1);' /></div>";
+          }
+        } catch(imgErr) {}
+        continue; 
+      }
+      
+      var formattedTitle = rawTitle ? rawTitle.replace(/\n/g, "<br>") : "Вопрос без названия";
+      var safeName = rawTitle ? rawTitle.replace(/'/g, "&#39;").replace(/"/g, "&quot;") : "field_" + i;
+      
+      var isReq = getReqAttr(item, type);
+      var reqStr = isReq ? " required" : "";
+      var labelClass = isReq ? "form-label req-label" : "form-label";
+      
+      html += "<label class='" + labelClass + "' style='white-space: pre-wrap;'>" + formattedTitle + ":</label>";
+      
+      if (type == FormApp.ItemType.LIST) {
+        var choices = item.asListItem().getChoices();
+        html += "<select name='" + safeName + "'" + reqStr + ">";
+        for (var c = 0; c < choices.length; c++) { 
+          html += "<option value='" + choices[c].getValue().replace(/'/g, "&#39;").replace(/"/g, "&quot;") + "'>" + choices[c].getValue() + "</option>"; 
+        }
+        html += "</select>";
+      } 
+      else if (type == FormApp.ItemType.MULTIPLE_CHOICE) {
+        var choices = item.asMultipleChoiceItem().getChoices();
+        html += "<div class='radio-group'>";
+        for (var c = 0; c < choices.length; c++) { 
+          html += "<label class='radio-label'><input type='radio' name='" + safeName + "' value='" + choices[c].getValue().replace(/'/g, "&#39;").replace(/"/g, "&quot;") + "'" + reqStr + "> " + choices[c].getValue() + "</label>"; 
+        }
+        html += "</div>";
+      }
+      else if (type == FormApp.ItemType.SCALE) {
+        var scaleItem = item.asScaleItem();
+        var min = scaleItem.getLowerBound(); 
+        var max = scaleItem.getUpperBound(); 
+        html += "<div class='scale-wrapper'>";
+        for (var j = min; j <= max; j++) { 
+          html += "<label class='scale-btn'><input type='radio' name='" + safeName + "' value='" + j + "'" + reqStr + "><span>" + j + "</span></label>"; 
+        }
+        html += "</div>";
+      } 
+      else if (type == FormApp.ItemType.PARAGRAPH_TEXT) { html += "<textarea name='" + safeName + "' rows='3'" + reqStr + "></textarea>"; } 
+      else { html += "<input type='text' name='" + safeName + "'" + reqStr + ">"; }
+    }
+    
+    // Бронебойный разделитель "|||"
+    var responseText = title + "|||" + maxDaily + "|||" + html;
+    console.log("Ответ для формы " + idx + ": " + responseText.substring(0, 100) + "...");
+    return ContentService.createTextOutput(responseText).setMimeType(ContentService.MimeType.TEXT);
+  }
+  
+  if (action === "resettoken") return ContentService.createTextOutput("RESET_SUCCESS").setMimeType(ContentService.MimeType.TEXT);
+  if (action === "resetalltokens") return ContentService.createTextOutput("RESET_ALL_SUCCESS").setMimeType(ContentService.MimeType.TEXT);
+}
+
+function doPost(e) {
+  try {
+    var data = e.parameter; 
+    var formIndex = parseInt(data["form_index"]);
+    var token = data["token"];
+    
+    if (isNaN(formIndex) || formIndex >= FORMS_CONFIG.length) return ContentService.createTextOutput("ERROR_SERVER").setMimeType(ContentService.MimeType.TEXT);
+    
+    var config = FORMS_CONFIG[formIndex];
+    var form = FormApp.openById(config.formId);
+    var formResponse = form.createResponse();
+    var items = form.getItems();
+    
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      var title = item.getTitle();
+      var value = undefined;
+
+      if (title && (title.toLowerCase().trim() === "токен" || title.toLowerCase().trim() === "token")) { value = token; } 
+      else if (title && data[title] !== undefined) { value = data[title]; }
+
+      if (value !== undefined) {
+        if (item.getType() == FormApp.ItemType.TEXT) { formResponse.withItemResponse(item.asTextItem().createResponse(value)); } 
+        else if (item.getType() == FormApp.ItemType.SCALE) { formResponse.withItemResponse(item.asScaleItem().createResponse(parseInt(value))); } 
+        else if (item.getType() == FormApp.ItemType.LIST) { formResponse.withItemResponse(item.asListItem().createResponse(value)); } 
+        else if (item.getType() == FormApp.ItemType.MULTIPLE_CHOICE) { formResponse.withItemResponse(item.asMultipleChoiceItem().createResponse(value)); } 
+        else if (item.getType() == FormApp.ItemType.PARAGRAPH_TEXT) { formResponse.withItemResponse(item.asParagraphTextItem().createResponse(value)); }
+      }
+    }
+    formResponse.submit();
+    return ContentService.createTextOutput("SUCCESS").setMimeType(ContentService.MimeType.TEXT);
+  } catch(error) {
+    return ContentService.createTextOutput("ERROR_SERVER").setMimeType(ContentService.MimeType.TEXT);
+  }
+}

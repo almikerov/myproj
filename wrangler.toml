@@ -1,0 +1,16 @@
+﻿name = "esp32-cloud"
+main = "cloudflare/worker.js"
+compatibility_date = "2026-06-25"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "esp32-cloud"
+database_id = "b8f57ebd-c5ab-4e6b-8f41-6e11629160c2"
+
+[vars]
+GAS_URL = "https://script.google.com/macros/s/AKfycbw6UBeU1AqIufbMMQsscMWH1j2ptRGQbKYzIzKBmi7KegfDwhkx6iJvEXElr9RZYOcS/exec"
+
+[[kv_namespaces]]
+binding = "FIRMWARE_KV"
+id = "503b1f3a15af44ff8871a6b12a063180"
+

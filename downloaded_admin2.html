@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ESP32 Cloud Manager</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root { 
+      --bg: #0f1115; 
+      --surface: rgba(25, 28, 35, 0.7); 
+      --surface-border: rgba(255, 255, 255, 0.08);
+      --text: #e2e8f0; 
+      --muted: #94a3b8; 
+      --accent: #3b82f6; 
+      --accent-hover: #2563eb;
+      --ok: #10b981; 
+      --bad: #ef4444; 
+      --warn: #f59e0b; 
+    }
+    * { box-sizing: border-box; }
+    body { 
+      margin: 0; 
+      font-family: 'Inter', sans-serif; 
+      color: var(--text); 
+      background: var(--bg);
+      background-image: 
+        radial-gradient(at 0% 0%, rgba(59, 130, 246, 0.15) 0px, transparent 50%),
+        radial-gradient(at 100% 0%, rgba(16, 185, 129, 0.1) 0px, transparent 50%);
+      background-attachment: fixed;
+      min-height: 100vh;
+    }
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.2); border-radius: 4px; }
+    
+    header { 
+      display: flex; align-items: center; justify-content: space-between; gap: 16px; 
+      padding: 20px 32px; 
+      background: rgba(15, 17, 21, 0.8);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--surface-border); 
+      position: sticky; top: 0; z-index: 10; 
+    }
+    h1 { font-size: 20px; margin: 0; font-weight: 600; letter-spacing: -0.02em; background: linear-gradient(to right, #fff, #94a3b8); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    main { padding: 32px; display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 24px; max-width: 1600px; margin: 0 auto; }
+    
+    section, aside { 
+      background: var(--surface); 
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid var(--surface-border); 
+      border-radius: 16px; 
+      padding: 24px; 
+      box-shadow: 0 4px 24px -1px rgba(0,0,0,0.2);
+    }
+    
+    h2 { font-size: 16px; margin: 0 0 16px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+    h2::before { content: ''; display: block; width: 4px; height: 16px; background: var(--accent); border-radius: 2px; }
+    hr { border: 0; height: 1px; background: var(--surface-border); margin: 24px 0; }
+    
+    label { display: block; color: var(--muted); font-size: 13px; margin: 12px 0 6px; font-weight: 500; }
+    input, select, textarea { 
+      width: 100%; border: 1px solid var(--surface-border); border-radius: 8px; 
+      padding: 10px 12px; font-family: inherit; font-size: 14px;
+      background: rgba(0, 0, 0, 0.2); color: var(--text);
+      transition: all 0.2s; outline: none;
+    }
+    input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2); }
+    textarea { min-height: 80px; resize: vertical; }
+    
+    button { 
+      border: 0; border-radius: 8px; padding: 10px 16px; 
+      background: var(--accent); color: white; font-weight: 600; font-size: 14px;
+      cursor: pointer; transition: all 0.2s; width: 100%; display: flex; justify-content: center; align-items: center; gap: 8px;
+    }
+    button:hover { background: var(--accent-hover); transform: translateY(-1px); }
+    button:active { transform: translateY(0); }
+    button.secondary { background: rgba(255, 255, 255, 0.1); width: auto; }
+    button.secondary:hover { background: rgba(255, 255, 255, 0.15); }
+    button.warn { background: var(--warn); }
+    button.warn:hover { background: #d97706; }
+    
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 24px; }
+    .row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .muted { color: var(--muted); font-size: 13px; }
+    
+    .status { font-weight: 600; padding: 4px 8px; border-radius: 6px; font-size: 12px; display: inline-block; }
+    .status.active { background: rgba(16, 185, 129, 0.15); color: var(--ok); border: 1px solid rgba(16, 185, 129, 0.2); }
+    .status.queued { background: rgba(245, 158, 11, 0.15); color: var(--warn); border: 1px solid rgba(245, 158, 11, 0.2); }
+    
+    .ok { color: var(--ok); }
+    .bad { color: var(--bad); }
+    
+    .table-container { overflow-x: auto; margin-top: 8px; }
+    table { width: 100%; border-collapse: separate; border-spacing: 0; }
+    th, td { padding: 12px 16px; text-align: left; vertical-align: middle; border-bottom: 1px solid var(--surface-border); }
+    th { font-size: 12px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 2px solid var(--surface-border); white-space: nowrap; }
+    td { font-size: 14px; }
+    tr { transition: background 0.2s; }
+    tr:hover td { background: rgba(255, 255, 255, 0.03); }
+    
+    pre { 
+      max-height: 400px; overflow: auto; background: rgba(0, 0, 0, 0.4); color: #a5b4fc; 
+      padding: 16px; border-radius: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 13px; line-height: 1.6; border: 1px solid var(--surface-border);
+    }
+    
+    .pill { display: inline-flex; align-items: center; padding: 6px 12px; background: rgba(255, 255, 255, 0.05); border: 1px solid var(--surface-border); border-radius: 20px; font-size: 13px; font-weight: 500; }
+    .pill .dot { width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; }
+    .pill .dot.ok { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+    .pill .dot.bad { background: var(--bad); box-shadow: 0 0 8px var(--bad); }
+
+    @media (max-width: 900px) { 
+      main { grid-template-columns: 1fr; padding: 16px; } 
+      header { flex-direction: column; align-items: stretch; }
+      .row { flex-direction: column; align-items: stretch; }
+      button.secondary { width: 100%; }
+    }
+    
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+    main > * { animation: fadeIn 0.4s ease-out forwards; }
+    main > *:nth-child(2) { animation-delay: 0.1s; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>ESP32 Cloud Manager <span style="font-size: 14px; font-weight: 500; color: var(--muted); vertical-align: middle; margin-left: 8px; padding: 2px 6px; border-radius: 6px; background: var(--surface-border);">v1.0.0</span></h1>
+    </div>
+    <div class="row">
+      <div class="pill" id="health-pill">
+        <div class="dot bad" id="health-dot"></div>
+        <span id="health">Checking service...</span>
+      </div>
+      <div style="display: flex; gap: 8px;">
+        <input id="token" type="password" placeholder="Admin token" autocomplete="current-password" style="width: 200px;">
+        <button id="saveToken" class="secondary" onclick="if(window.submitAuth) window.submitAuth()">Authenticate</button>
+      </div>
+    </div>
+  </header>
+  <main>
+    <aside>
+      <h2>Register Device</h2>
+      <label>Device ID</label><input id="deviceId" placeholder="esp32-kitchen-01">
+      <label>Secret</label><input id="deviceSecret" type="password" placeholder="Strong per-device secret">
+      <label>Firmware Version</label><input id="deviceFirmware" value="0.1.0">
+      <button id="createDevice" style="margin-top: 16px;">Save Device</button>
+      
+      <hr>
+      <h2>Queue Command</h2>
+      <label>Device</label><select id="commandDevice"></select>
+      <label>Type <span title="Commands: reboot, shutdown, update_wifi, get_commands, sync_forms, view_tokens, reset_token" style="cursor:help; background:var(--surface-border); border-radius:50%; width:16px; height:16px; display:inline-block; text-align:center; font-size:11px; line-height:16px;">i</span></label>
+      <input id="commandType" value="reboot">
+      <label>Payload (JSON)</label><textarea id="commandPayload">{}</textarea>
+      <button id="queueCommand" class="warn" style="margin-top: 16px;">Queue Command</button>
+      
+      <hr>
+      <h2>Firmware Release</h2>
+      <label>Target Version</label><input id="fwVersion" placeholder="1.0.0">
+      <label>Upload .bin File</label><input type="file" id="fwFile" accept=".bin">
+      <button id="publishFirmware" style="margin-top: 16px;">Upload & Publish</button>
+    </aside>
+    <section>
+      <div class="grid">
+        <div style="grid-column: 1 / -1;">
+          <h2>Fleet Status</h2>
+          <div class="table-container">
+            <table>
+              <thead><tr><th>ID</th><th>Status</th><th>Firmware</th><th>Wi-Fi Network</th><th>Last Seen</th><th>Actions</th></tr></thead>
+              <tbody id="devices"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      <h2 style="margin-top: 32px;">Real-time Logs</h2>
+      <pre id="logs"></pre>
+    </section>
+  </main>
+  <script>
+    const state = { devices: [] };
+    const token = document.getElementById("token");
+    try { token.value = localStorage.getItem("esp32_admin_token") || ""; } catch(e) {}
+
+    const api = async (path, options = {}) => {
+      const response = await fetch(path, {
+        ...options,
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer " + token.value,
+          ...(options.headers || {})
+        }
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "request_failed");
+      return data;
+    };
+
+    const formatDate = (iso) => {
+      if(!iso) return "never";
+      const d = new Date(iso);
+      return d.toLocaleString();
+    };
+
+    window.showError = (error) => { 
+      const msg = error && error.message ? error.message : String(error);
+      const h = document.getElementById("health");
+      const d = document.getElementById("health-dot");
+      if (h) h.textContent = msg; 
+      if (d) d.className = "dot bad"; 
+      console.error("UI Error:", error);
+    };
+    
+    window.refresh = async () => {
+      try {
+        let health;
+        try {
+          health = await fetch("/api/health").then(r => r.json());
+        } catch(e) {
+          throw new Error("Cannot connect to API");
+        }
+        
+        const h = document.getElementById("health");
+        const d = document.getElementById("health-dot");
+        if (h) h.textContent = health.d1 ? "D1 connected" : "D1 missing";
+        if (d) d.className = "dot " + (health.d1 ? "ok" : "bad");
+        
+        if (!token.value) {
+           if (h) h.textContent = "Auth required";
+           if (d) d.className = "dot warn";
+           return;
+        }
+
+        const [devices, commands, logs] = await Promise.all([
+          api("/api/admin/devices"),
+          api("/api/admin/commands"),
+          api("/api/admin/logs?limit=100")
+        ]);
+        
+        state.devices = devices.devices;
+        renderDevices(devices.devices);
+        renderCommands(commands.commands);
+        renderLogs(logs.logs);
+      } catch (err) {
+        window.showError(err);
+      }
+    };
+
+    const renderDevices = (items) => {
+      document.getElementById("devices").innerHTML = items.map(d =>
+        "<tr><td><div style='font-weight:600; color:var(--text);'>" + esc(d.device_id) + "</div></td><td><span class='status " + esc(d.status) + "'>" + esc(d.status) + "</span></td><td>" + esc(d.firmware_version || "") + "</td><td><div style='font-weight:500;'>" + (d.wifi_ssid ? esc(d.wifi_ssid) : "—") + "</div><div class='muted' style='margin-top:4px; font-family:monospace;'>" + (d.wifi_pass ? "***" : "—") + "</div></td><td class='muted'>" + formatDate(d.last_seen_at) + "</td><td><div style='display:flex; gap:4px;'><button class='secondary' onclick='editDevice("" + escAttr(d.device_id) + "")' title='Edit' style='padding:4px 8px;'>✏️</button><button class='secondary' onclick='delDevice("" + escAttr(d.device_id) + "")' title='Delete' style='padding:4px 8px;'>🗑️</button><button class='secondary' onclick='queue("" + escAttr(d.device_id) + "","reboot")' title='Reboot' style='padding:4px 8px;'>🔄</button><button class='secondary' onclick='queue("" + escAttr(d.device_id) + "","shutdown")' title='Sleep/Shutdown' style='padding:4px 8px;'>💤</button></div></td></tr>"
+      ).join("");
+      
+      document.getElementById("commandDevice").innerHTML = items.map(d =>
+        "<option value='" + escAttr(d.device_id) + "'>" + esc(d.device_id) + "</option>"
+      ).join("");
+    };
+
+    window.editDevice = (id) => {
+      const d = state.devices.find(x => x.device_id === id);
+      if(!d) return;
+      document.getElementById("deviceId").value = d.device_id;
+      document.getElementById("deviceFirmware").value = d.firmware_version;
+      document.getElementById("deviceSecret").value = "";
+      if (d.wifi_ssid) {
+        const ssid = prompt("Set new Wi-Fi SSID for " + d.device_id, d.wifi_ssid);
+        if (ssid !== null) {
+          const pass = prompt("Set new Wi-Fi Password for " + d.device_id, "");
+          if (pass !== null) {
+             api("/api/admin/commands", { method: "POST", body: JSON.stringify({
+               deviceId: id, type: "update_wifi", payload: { ssid, pass }
+             }) }).then(() => { alert("Wi-Fi update command queued!"); refresh(); }).catch(showError);
+          }
+        }
+      } else {
+        document.getElementById("deviceId").focus();
+      }
+    };
+
+    window.delDevice = (id) => {
+      if(confirm("Delete device " + id + "?")) {
+        api("/api/admin/devices", { method: "DELETE", body: JSON.stringify({ deviceId: id }) })
+          .then(() => refresh()).catch(showError);
+      }
+    };
+
+    window.queue = (id, type) => {
+      api("/api/admin/commands", { method: "POST", body: JSON.stringify({
+        deviceId: id, type: type, payload: {}
+      }) }).then(() => refresh()).catch(showError);
+    };
+
+    const renderCommands = (items) => {};
+
+    const renderLogs = (items) => {
+      const logsEl = document.getElementById("logs");
+      if (!logsEl) return;
+      logsEl.innerHTML = items.map(l =>
+        "<span style='color:var(--muted)'>[" + formatDate(l.created_at) + "]</span> <span style='color:#fcd34d;'>" + esc(l.device_id) + "</span> <span style='color:var(--ok)'>" + esc(l.level) + "</span>: " + esc(l.message)
+      ).join("\n");
+    };
+
+    window.submitAuth = () => {
+      try { localStorage.setItem("esp32_admin_token", token.value); } catch(e) {}
+      const h = document.getElementById("health");
+      if (h) h.textContent = "Loading...";
+      window.refresh();
+    };
+
+    const tokenEl = document.getElementById("token");
+    if (tokenEl) {
+      tokenEl.onkeydown = (e) => { if(e.key === "Enter") window.submitAuth(); };
+    }
+
+    const btnCreate = document.getElementById("createDevice");
+    if (btnCreate) btnCreate.onclick = async () => {
+      try {
+        await api("/api/admin/devices", { method: "POST", body: JSON.stringify({
+          deviceId: value("deviceId"), secret: value("deviceSecret"),
+          firmwareVersion: value("deviceFirmware")
+        }) });
+        alert("Device saved!");
+        await refresh();
+      } catch(e) { alert(e.message); }
+    };
+
+    document.getElementById("queueCommand").onclick = async () => {
+      try {
+        await api("/api/admin/commands", { method: "POST", body: JSON.stringify({
+          deviceId: value("commandDevice"), type: value("commandType"),
+          payload: JSON.parse(value("commandPayload") || "{}")
+        }) });
+        alert("Command queued!");
+        await refresh();
+      } catch(e) { alert(e.message); }
+    };
+
+    document.getElementById("publishFirmware").onclick = async () => {
+      try {
+        const fileInput = document.getElementById("fwFile");
+        if (!fileInput.files.length) return alert("Select a .bin file");
+        const version = value("fwVersion");
+        if (!version) return alert("Enter target version");
+        
+        document.getElementById("publishFirmware").textContent = "Uploading...";
+        const res = await fetch("/api/admin/firmware/upload?version=" + encodeURIComponent(version), {
+          method: "POST",
+          headers: { "Authorization": "Bearer " + token.value },
+          body: fileInput.files[0]
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error);
+        alert("Firmware published! URL: " + data.url);
+        document.getElementById("publishFirmware").textContent = "Upload & Publish";
+        await refresh();
+      } catch(e) { 
+        alert(e.message); 
+        document.getElementById("publishFirmware").textContent = "Upload & Publish";
+      }
+    };
+
+    const value = (id) => {
+      const el = document.getElementById(id);
+      return el ? el.value.trim() : "";
+    };
+    const esc = (s) => String(s !== null && s !== undefined ? s : "").replace(/[&<>"']/g, ch => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[ch]));
+    window.escAttr = esc;
+    
+    try {
+      window.refresh();
+      setInterval(window.refresh, 15000);
+    } catch(e) {
+      window.showError(e);
+    }
+  </script>
+</body>
+</html>

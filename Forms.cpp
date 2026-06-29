@@ -1,0 +1,140 @@
+#include "Forms.h"
+#include "Logger.h"
+#include "ESPNetwork.h"
+#include "Config.h"
+#include <LittleFS.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <esp_task_wdt.h>
+
+FormManager Forms;
+
+// Removed writeHttpBodyToFile and readStringUntilToken
+
+void FormManager::begin() {
+    if(!LittleFS.begin(true)){
+        Logger.add("❌ Ошибка монтирования LittleFS!", "error");
+    }
+}
+
+String FormManager::getLocalToken(const String& formNumber, IPAddress ip) {
+    int hash = (ip[3] * 137) ^ (formNumber.toInt() * 89);
+    hash = hash + 4096; 
+    char hexBuf[10]; 
+    sprintf(hexBuf, "%X", hash);
+    return "TK-" + String(hexBuf); 
+}
+
+bool FormManager::fetchFromServer() {
+    if (!ESPNetwork.isConnected()) {
+        Logger.add("Нет сети, пропускаем скачивание опросников.");
+        return false;
+    }
+    Logger.add("--- НАЧАЛО: Запрос списка опросников ---");
+
+    // === Запрос количества форм (отдельный клиент) ===
+    {
+        WiFiClientSecure countClient;
+        countClient.setInsecure();
+        HTTPClient http;
+        
+        http.begin(countClient, Config.cloud_url + "?action=getFormCount");
+        http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+        http.setTimeout(45000);
+        http.setReuse(false);
+        http.useHTTP10(true);
+        http.addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+        
+        int countCode = http.GET();
+        Logger.add("HTTP Код (Список): " + String(countCode));
+
+        if (countCode == 200) {
+            formCount = http.getString().toInt();
+            Logger.add("✅ Найдено опросов: " + String(formCount));
+        } else {
+            Logger.add("❌ Ошибка получения списка: " + String(countCode), "error");
+        }
+        http.end();
+    } // countClient уничтожается здесь, освобождая память
+    
+    if (formCount <= 0) return false;
+
+    formTitles.assign(formCount, "Загрузка опроса...");
+    formMaxDaily.assign(formCount, 1);
+    formHtmlOffsets.assign(formCount, 0);
+
+    int loadedCount = 0;
+    for (int i = 0; i < formCount; i++) {
+        esp_task_wdt_reset();
+        Logger.add("Скачивание опроса #" + String(i + 1) + "...");
+        
+        // КРИТИЧЕСКИ ВАЖНО: Создаем СВЕЖИЙ WiFiClientSecure для КАЖДОЙ формы!
+        // Повторное использование одного клиента приводит к тому, что TLS-сессия
+        // остается в грязном состоянии после http.end(), и следующий запрос
+        // либо не устанавливается, либо получает мусор.
+        WiFiClientSecure formClient;
+        formClient.setInsecure();
+        HTTPClient formHttp;
+
+        formHttp.begin(formClient, Config.cloud_url + "?action=getForm&index=" + String(i));
+        formHttp.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS); 
+        formHttp.setTimeout(45000);
+        formHttp.setReuse(false);
+        formHttp.useHTTP10(true);
+        formHttp.addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+        formHttp.addHeader("Connection", "close");
+
+        int formCode = formHttp.GET();
+        if (formCode == 200) {
+            String fileName = "/raw_" + String(i) + ".txt";
+            File file = LittleFS.open(fileName, FILE_WRITE);
+            if (file) {
+                formHttp.writeToStream(&file);
+                file.close();
+                
+                Logger.add("Парсинг...");
+                file = LittleFS.open(fileName, FILE_READ);
+                if (file) {
+                    String title = file.readStringUntil('|'); file.read(); file.read();
+                    String maxDailyStr = file.readStringUntil('|'); file.read(); file.read();
+                    
+                    title.trim(); maxDailyStr.trim();
+                    if (title.length() == 0) title = "Опросник " + String(i + 1);
+                    title.replace("<", "&lt;"); title.replace(">", "&gt;");
+                    
+                    formTitles[i] = title;
+                    formMaxDaily[i] = maxDailyStr.toInt();
+                    formHtmlOffsets[i] = file.position(); 
+                    file.close();
+                    
+                    loadedCount++;
+                    Logger.add("✅ Опрос [" + title + "] загружен!");
+                } else {
+                    Logger.add("❌ Ошибка чтения файла формы.", "error");
+                }
+            } else {
+                Logger.add("❌ Ошибка открытия файла на запись.", "error");
+            }
+        } else {
+            Logger.add("❌ Провал скачивания #" + String(i+1) + ": код " + String(formCode), "error");
+        }
+        formHttp.end();
+    }
+    Logger.add("Загружено опросников: " + String(loadedCount) + " из " + String(formCount));
+    Logger.add("--- КОНЕЦ: Обновление опросников ---");
+    return loadedCount > 0;
+}
+
+String FormManager::urlEncode(const String& str) {
+    String encodedString = ""; char c, code0, code1;
+    for (unsigned int i = 0; i < str.length(); i++) {
+        c = str.charAt(i);
+        if (c == ' ') encodedString += '+'; else if (isalnum(c)) encodedString += c;
+        else {
+            code1 = (c & 0xf) + '0'; if ((c & 0xf) > 9) code1 = (c & 0xf) - 10 + 'A';
+            c = (c >> 4) & 0xf; code0 = c + '0'; if (c > 9) code0 = c - 10 + 'A';
+            encodedString += '%'; encodedString += code0; encodedString += code1;
+        }
+    }
+    return encodedString;
+}

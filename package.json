@@ -1,0 +1,25 @@
+{
+  "name": "esp32-cloud-control",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check:worker": "node --check cloudflare/worker.js",
+    "cf:login": "wrangler login",
+    "cf:whoami": "wrangler whoami",
+    "cf:d1:create": "wrangler d1 create esp32-cloud",
+    "cf:d1:init": "wrangler d1 execute esp32-cloud --file cloudflare/schema.sql --remote",
+    "cf:deploy": "wrangler deploy",
+    "deploy:cloudflare": "powershell -ExecutionPolicy Bypass -File scripts/deploy-cloudflare.ps1",
+    "fw:setup": "powershell -ExecutionPolicy Bypass -File scripts/setup-arduino.ps1",
+    "fw:compile": "powershell -ExecutionPolicy Bypass -File scripts/compile-esp32.ps1",
+    "fw:upload": "powershell -ExecutionPolicy Bypass -File scripts/upload-esp32.ps1",
+    "fw:monitor": "powershell -ExecutionPolicy Bypass -File scripts/monitor-esp32.ps1"
+  },
+  "devDependencies": {
+    "wrangler": "^4.22.0"
+  },
+  "dependencies": {
+    "jsdom": "^29.1.1"
+  }
+}

@@ -1,0 +1,15 @@
+name = "esp32-cloud"
+main = "cloudflare/worker.js"
+compatibility_date = "2026-06-25"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "esp32-cloud"
+database_id = "replace-with-cloudflare-d1-id"
+
+[vars]
+GAS_URL = "https://script.google.com/macros/s/AKfycbw6UBeU1AqIufbMMQsscMWH1j2ptRGQbKYzIzKBmi7KegfDwhkx6iJvEXElr9RZYOcS/exec"
+
+# Set as secrets, not plain vars:
+# wrangler secret put ADMIN_TOKEN
+# wrangler secret put DEVICE_BOOTSTRAP_TOKEN
