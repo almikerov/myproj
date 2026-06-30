@@ -19,9 +19,12 @@ private:
     void handleLogin();
     void handleLogout();
     void handleChangePass();
+    void handleImage();
     void handleForm();
+    void handleFormBody();
     void handleSubmit();
     void handleAdmin();
+    void handleProgress();
     void handleSaveSettings();
     void handleUpdate();
     void handleReboot();

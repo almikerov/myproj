@@ -9,6 +9,22 @@
 
 WebUIManager WebUI;
 
+static String jsonEscape(const String& input) {
+    String out = "";
+    out.reserve(input.length() + 16);
+    for (unsigned int i = 0; i < input.length(); i++) {
+        char c = input[i];
+        if (c == '\\') out += "\\\\";
+        else if (c == '"') out += "\\\"";
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else if (c == '\t') out += "\\t";
+        else if ((uint8_t)c < 32) out += ' ';
+        else out += c;
+    }
+    return out;
+}
+
 void WebUIManager::begin() {
     const char * headerKeys[] = {"Cookie", "Host"};
     server.collectHeaders(headerKeys, 2);
@@ -18,8 +34,10 @@ void WebUIManager::begin() {
     server.on("/logout", [this]() { handleLogout(); });
     server.on("/change_pass", HTTP_POST, [this]() { handleChangePass(); });
     server.on("/form", [this]() { handleForm(); });
+    server.on("/form_body", [this]() { handleFormBody(); });
     server.on("/submit", HTTP_POST, [this]() { handleSubmit(); });
     server.on("/admin", [this]() { handleAdmin(); });
+    server.on("/progress", [this]() { handleProgress(); });
     server.on("/save_settings", HTTP_POST, [this]() { handleSaveSettings(); });
     server.on("/update", [this]() { handleUpdate(); });
     server.on("/reboot", [this]() { handleReboot(); });
@@ -65,6 +83,7 @@ String WebUIManager::getHtmlHeader() {
     html += ".scale-btn input:checked + span { background: #1a73e8; color: white; border-color: #1a73e8; transform: scale(1.05); box-shadow: 0 4px 10px rgba(26,115,232,0.3); } ";
     html += ".btn{background:#1a73e8; color:white; border:none; width:100%; padding:15px; border-radius:8px; font-weight:bold; font-size:16px; margin-top:20px; cursor:pointer; display:block; text-align:center; text-decoration:none; box-sizing:border-box;} ";
     html += ".btn-green{background:#2ecc71;} .btn-orange{background:#f39c12;} .btn-red{background:#e74c3c;} .btn-gray{background:#7f8c8d;} ";
+    html += ".lazy-img{min-height:40px; background:#f1f3f4;} ";
     html += ".loader{border:5px solid #f3f3f3; border-top:5px solid #1a73e8; border-radius:50%; width:50px; height:50px; animation:spin 1s linear infinite; margin:20px auto;} @keyframes spin{0%{transform:rotate(0deg);} 100%{transform:rotate(360deg);}}</style>";
     
     html += "<script>";
@@ -87,6 +106,8 @@ String WebUIManager::getHtmlHeader() {
     html += "if(t.trim()=='SUCCESS') document.getElementById('res-msg').innerHTML='<h2 style=\"color:#2ecc71;\">✅ Успешно!</h2><p>Ваши данные сохранены.</p>'; ";
     html += "else { document.getElementById('res-msg').innerHTML='<h2 style=\"color:#e74c3c;\">❌ Доступ закрыт</h2><p>Лимит прохождений этого опроса исчерпан.</p>'; } }) ";
     html += ".catch(err => { document.getElementById('load').style.display='none'; document.getElementById('res').style.display='block'; document.getElementById('res-msg').innerHTML='<h2 style=\"color:#e74c3c;\">❌ Обрыв связи</h2><p>Плата потеряла сеть.</p>'; }); } ";
+    html += "function initLazyImages(root){(root||document).querySelectorAll('img[data-src]').forEach(img=>{if(!img.dataset.loaded){img.dataset.loaded='1';img.src=img.dataset.src;}});} ";
+    html += "document.addEventListener('DOMContentLoaded',()=>setTimeout(()=>initLazyImages(document),120)); ";
     html += "</script></head><body>";
     return html;
 }
@@ -107,11 +128,32 @@ void WebUIManager::handleRoot() {
         String btnColor = "btn";
         if (i % 3 == 1) btnColor = "btn btn-green";
         if (i % 3 == 2) btnColor = "btn btn-orange";
-        content += "<button class='" + btnColor + "' onclick=\"window.location.href='/form?id=" + String(i) + "&token=" + Forms.getLocalToken(String(i), server.client().remoteIP()) + "'\">" + Forms.formTitles[i] + "</button>";
+        bool ready = i < (int)Forms.formReady.size() && Forms.formReady[i];
+        if (ready) {
+            content += "<button class='" + btnColor + "' onclick=\"window.location.href='/form?id=" + String(i) + "&token=" + Forms.getLocalToken(String(i), server.client().remoteIP()) + "'\">" + Forms.formTitles[i] + "</button>";
+        } else {
+            content += "<button class='btn btn-gray' disabled style='opacity:.65;'>" + Forms.formTitles[i] + " - загрузка</button>";
+        }
     }
     content += "</div></div>";
+    String prefetchUrls = "";
+    for (int i = 0; i < Forms.formCount; i++) {
+        bool ready = i < (int)Forms.formReady.size() && Forms.formReady[i];
+        if (!ready) continue;
+        String url = "/form_body?id=" + String(i);
+        if (i < (int)Forms.formRevisions.size() && Forms.formRevisions[i].length() > 0) {
+            url += "&r=" + Forms.urlEncode(Forms.formRevisions[i]);
+        }
+        if (prefetchUrls.length() > 0) prefetchUrls += ",";
+        prefetchUrls += "'" + url + "'";
+    }
+    if (prefetchUrls.length() > 0) {
+        content += "<script>window.addEventListener('load',()=>setTimeout(()=>{let q=[" + prefetchUrls + "],i=0;function next(){if(i>=q.length)return;fetch(q[i++],{cache:'force-cache'}).finally(()=>setTimeout(next,250));}next();},1200));</script>";
+    }
+    content += "<div id='progressBox' style='display:block; max-width:450px; margin:14px auto 0; background:white; border:1px solid #e3e7ea; border-radius:8px; padding:12px; box-sizing:border-box;'><div id='progressText' style='font-weight:bold; margin-bottom:8px;'>Загрузка</div><div style='height:12px; background:#edf1f5; border-radius:99px; overflow:hidden;'><div id='progressBar' style='height:100%; width:0%; background:#1a73e8; transition:width .25s;'></div></div><div id='progressMeta' style='font-size:12px; color:#5f6368; margin-top:8px;'></div></div>";
     
     content += "<div style='text-align:center; margin-top:30px; margin-bottom:20px; padding:20px;'><span onclick=\"let n=Date.now(); if(n-(this.l||0)<600) window.location.href='/admin'; this.l=n;\" style='color:#bdc3c7; font-size:12px; letter-spacing:1px; cursor:pointer;'>АДМИН-ПАНЕЛЬ</span></div>";
+    content += "<script>function bfmt(n){if(!n)return '';if(n>1048576)return (n/1048576).toFixed(1)+' MB';return Math.round(n/1024)+' KB';}function upd(){fetch('/progress',{cache:'no-store'}).then(r=>r.json()).then(s=>{let p=Math.max(0,Math.min(100,s.percent||0));document.getElementById('progressBar').style.width=p+'%';document.getElementById('progressText').textContent=(s.message||'')+' - '+p+'%';let m='Готово '+(s.ready||0)+' из '+(s.forms||0);if(s.totalBytes)m+=' | '+bfmt(s.bytes)+' из '+bfmt(s.totalBytes);else if(s.bytes)m+=' | '+bfmt(s.bytes);if(s.images)m+=' | картинки '+(s.image||0)+' из '+s.images;document.getElementById('progressMeta').textContent=m;if(s.log!==undefined){let t=document.getElementById('syslog');t.value=s.log;}}).catch(()=>{});}setInterval(upd,1000);upd();</script>";
     content += "</body></html>";
     server.send(200, "text/html", content);
 }
@@ -158,6 +200,29 @@ void WebUIManager::handleChangePass() {
     server.send(200, "text/html", "<html><body style='text-align:center;padding:50px;'><h2 style='color:#2ecc71;'>✅ Пароль успешно изменен!</h2><button onclick=\"window.location.href='/admin'\">Вернуться</button></body></html>");
 }
 
+void WebUIManager::handleImage() {
+    String path = server.uri();
+    if (!path.startsWith("/img_")) {
+        server.send(404, "text/plain", "Not found");
+        return;
+    }
+
+    File file = LittleFS.open(path, FILE_READ);
+    if (!file) {
+        server.send(404, "text/plain", "Image not found");
+        return;
+    }
+
+    String contentType = "image/png";
+    if (path.endsWith(".jpg") || path.endsWith(".jpeg")) contentType = "image/jpeg";
+    else if (path.endsWith(".gif")) contentType = "image/gif";
+    else if (path.endsWith(".webp")) contentType = "image/webp";
+
+    server.sendHeader("Cache-Control", "max-age=86400");
+    server.streamFile(file, contentType);
+    file.close();
+}
+
 void WebUIManager::handleForm() {
     String idStr = server.arg("id");
     String t = server.arg("token");
@@ -167,6 +232,12 @@ void WebUIManager::handleForm() {
         server.send(404, "text/plain", "Форма не найдена"); return;
     }
 
+    if (id >= (int)Forms.formReady.size() || !Forms.formReady[id]) {
+        server.send(503, "text/html", "<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'></head><body style='font-family:sans-serif;text-align:center;padding:40px;'><h2>Опрос еще загружается</h2><button onclick=\"window.location.href='/'\" style='padding:14px 20px;'>В меню</button></body></html>");
+        return;
+    }
+
+    server.sendHeader("Cache-Control", "no-store");
     server.setContentLength(CONTENT_LENGTH_UNKNOWN);
     server.send(200, "text/html", "");
     
@@ -183,34 +254,61 @@ void WebUIManager::handleForm() {
         String fHead = "<div id='f" + String(id) + "' class='form-block'>";
         fHead += "<div class='top-token'>Ваш токен: <b>" + t + "</b></div>";
         fHead += "<h2>" + Forms.formTitles[id] + "</h2>";
-        fHead += "<form onsubmit='sendData(event, \"f" + String(id) + "\")'>";
+        fHead += "<form data-ready='0' onsubmit='if(this.dataset.ready!=\"1\"){return false;} sendData(event, \"f" + String(id) + "\")'>";
         fHead += "<input type='hidden' name='token' value='" + t + "'><input type='hidden' name='form_index' value='" + String(id) + "'>";
+        fHead += "<div id='formBody'><div class='loader'></div><p style='text-align:center;color:#5f6368;'>Загружаем вопросы...</p></div>";
         server.sendContent(fHead);
 
-        File file = LittleFS.open("/raw_" + String(id) + ".txt", FILE_READ);
-        if (file) {
-            file.seek(Forms.formHtmlOffsets[id]);
-            char buf[1025];
-            while(file.available()) {
-                size_t len = file.read((uint8_t*)buf, 1024);
-                buf[len] = '\0'; 
-                server.sendContent(buf); 
-            }
-            file.close();
-        } else {
-            server.sendContent("<p style='color:red;'>Ошибка чтения файла формы.</p>");
-        }
 
         String btnColor = "btn";
         if (id % 3 == 1) btnColor = "btn btn-green"; if (id % 3 == 2) btnColor = "btn btn-orange";
+        String bodyUrl = "/form_body?id=" + String(id);
+        if (id < (int)Forms.formRevisions.size() && Forms.formRevisions[id].length() > 0) {
+            bodyUrl += "&r=" + Forms.urlEncode(Forms.formRevisions[id]);
+        }
         String fTail = "<button type='submit' class='" + btnColor + "'>ОТПРАВИТЬ</button></form></div>";
         fTail += "<div id='load' style='display:none; text-align:center;'><h2>Отправка...</h2><div class='loader'></div></div>";
         fTail += "<div id='res' style='display:none; text-align:center;'><div id='res-msg'></div><button class='btn btn-gray' onclick=\"window.location.href='/'\">В меню</button></div>";
+        fTail += "<script>(function(){var body=document.getElementById('formBody');var form=document.querySelector('#f" + String(id) + " form');var btn=form.querySelector('button[type=submit]');btn.disabled=true;btn.style.opacity='.55';fetch('" + bodyUrl + "',{cache:'force-cache'}).then(r=>{if(!r.ok)throw new Error('load');return r.text();}).then(html=>{body.innerHTML=html;if(window.initLazyImages)initLazyImages(body);form.dataset.ready='1';btn.disabled=false;btn.style.opacity='1';}).catch(()=>{body.innerHTML=\"<p style='color:#e74c3c;text-align:center;'>Не удалось загрузить вопросы. Вернитесь назад и откройте опрос снова.</p>\";});})();</script>";
         server.sendContent(fTail);
     }
     
     server.sendContent("</div></body></html>");
     server.sendContent(""); 
+}
+
+void WebUIManager::handleFormBody() {
+    String idStr = server.arg("id");
+    int id = idStr.toInt();
+
+    if (id < 0 || id >= Forms.formCount || id >= (int)Forms.formReady.size() || !Forms.formReady[id]) {
+        server.sendHeader("Cache-Control", "no-store");
+        server.send(404, "text/plain", "Form body not found");
+        return;
+    }
+
+    File file = LittleFS.open("/raw_" + String(id) + ".txt", FILE_READ);
+    if (!file) {
+        server.sendHeader("Cache-Control", "no-store");
+        server.send(404, "text/plain", "Form file not found");
+        return;
+    }
+
+    file.seek(Forms.formHtmlOffsets[id]);
+    server.sendHeader("Cache-Control", "private, max-age=900");
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "text/html", "");
+
+    char buf[1025];
+    while (file.available()) {
+        size_t len = file.read((uint8_t*)buf, 1024);
+        buf[len] = '\0';
+        server.sendContent(buf);
+        delay(1);
+    }
+
+    file.close();
+    server.sendContent("");
 }
 
 void WebUIManager::handleSubmit() {
@@ -306,6 +404,7 @@ void WebUIManager::handleAdmin() {
     String wifiStatus = ESPNetwork.isConnected() ? "<span style='color:#2ecc71;'>✅ Подключено (IP: " + ESPNetwork.getIP() + ")</span>" : "<span style='color:#e74c3c;'>❌ Отключено от сети</span>";
     content += "<div style='background:#f9f9f9; padding:20px; border-radius:10px; margin-bottom:20px;'><h3>Диагностика системы</h3>";
     content += "<p style='font-size:16px; margin-bottom:15px;'>Статус Wi-Fi: " + wifiStatus + "</p>";
+    content += "<div id='progressBox' style='background:#fff; border:1px solid #e3e7ea; border-radius:8px; padding:12px; margin-bottom:12px;'><div id='progressText' style='font-weight:bold; margin-bottom:8px;'>Загрузка не идет</div><div style='height:12px; background:#edf1f5; border-radius:99px; overflow:hidden;'><div id='progressBar' style='height:100%; width:0%; background:#1a73e8; transition:width .25s;'></div></div><div id='progressMeta' style='font-size:12px; color:#5f6368; margin-top:8px;'></div></div>";
     content += "<textarea id='syslog' readonly style='width:100%; height:180px; background:#2c3e50; color:#ecf0f1; font-family:monospace; font-size:13px; padding:10px; border-radius:5px; resize:vertical;'>" + Logger.getSystemLog() + "</textarea>";
     
     content += "<div style='display:flex; gap:10px; margin-top:10px;'>";
@@ -330,7 +429,40 @@ void WebUIManager::handleAdmin() {
 
     content += "<button class='btn btn-gray' onclick=\"window.location.href='/logout'\">ВЫЙТИ ИЗ АДМИНКИ</button>";
     content += "</body></html>";
+    content += "<script>function bfmt(n){if(!n)return '';if(n>1048576)return (n/1048576).toFixed(1)+' MB';return Math.round(n/1024)+' KB';}function upd(){fetch('/progress',{cache:'no-store'}).then(r=>r.json()).then(s=>{let p=Math.max(0,Math.min(100,s.percent||0));document.getElementById('progressBar').style.width=p+'%';document.getElementById('progressText').textContent=(s.message||'')+' - '+p+'%';let m='Готово '+(s.ready||0)+' из '+(s.forms||0);if(s.totalBytes)m+=' | '+bfmt(s.bytes)+' из '+bfmt(s.totalBytes);else if(s.bytes)m+=' | '+bfmt(s.bytes);if(s.images)m+=' | картинки '+(s.image||0)+' из '+s.images;document.getElementById('progressMeta').textContent=m;let t=document.getElementById('syslog');if(t&&s.log!==undefined)t.value=s.log;}).catch(()=>{});}setInterval(upd,1000);upd();</script>";
     server.send(200, "text/html", content);
+}
+
+void WebUIManager::handleProgress() {
+    int forms = Forms.progressForms > 0 ? Forms.progressForms : Forms.formCount;
+    int ready = Forms.readyCount();
+    int percent = Forms.progressActive ? Forms.progressPercent : (forms > 0 ? (ready * 100) / forms : 0);
+    String message = Forms.progressMessage;
+    if (message.length() == 0) {
+        message = forms > 0 ? "Готово: " + String(ready) + " из " + String(forms) : "Опросы не загружены";
+    }
+
+    String json = "{";
+    json += "\"active\":";
+    json += Forms.progressActive ? "true" : "false";
+    json += ",\"phase\":\"" + jsonEscape(Forms.progressPhase) + "\"";
+    json += ",\"message\":\"" + jsonEscape(message) + "\"";
+    json += ",\"form\":" + String(Forms.progressForm);
+    json += ",\"forms\":" + String(forms);
+    json += ",\"ready\":" + String(ready);
+    json += ",\"percent\":" + String(percent);
+    json += ",\"bytes\":" + String((unsigned long)Forms.progressBytes);
+    json += ",\"totalBytes\":" + String((unsigned long)Forms.progressTotalBytes);
+    json += ",\"image\":" + String(Forms.progressImage);
+    json += ",\"images\":" + String(Forms.progressImages);
+    json += ",\"updatedMs\":" + String((unsigned long)Forms.progressUpdatedAt);
+    if (checkAuth()) {
+        json += ",\"log\":\"" + jsonEscape(Logger.getSystemLog()) + "\"";
+    }
+    json += "}";
+
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json", json);
 }
 
 void WebUIManager::handleSaveSettings() {
@@ -361,6 +493,11 @@ void WebUIManager::handleReboot() {
 }
 
 void WebUIManager::handleNotFound() {
+    if (server.uri().startsWith("/img_")) {
+        handleImage();
+        return;
+    }
+
     // Captive portal: отдаём HTML-страницу с редиректом вместо голого 302.
     // Некоторые ОС (iOS, новые Android) игнорируют 302 при детекции портала,
     // но корректно обрабатывают HTML-ответ с meta-refresh.

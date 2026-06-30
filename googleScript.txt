@@ -11,6 +11,90 @@ var FORMS_CONFIG = [
   }   
 ];
 
+var MAX_EMBEDDED_IMAGE_WIDTH = 720;
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function optimizeImageBlob(blob) {
+  try {
+    var image = ImagesService.openImage(blob);
+    var width = image.getWidth();
+    var height = image.getHeight();
+    if (width > MAX_EMBEDDED_IMAGE_WIDTH && height > 0) {
+      var resizedHeight = Math.max(1, Math.round(height * MAX_EMBEDDED_IMAGE_WIDTH / width));
+      return image.resize(MAX_EMBEDDED_IMAGE_WIDTH, resizedHeight).getBlob();
+    }
+  } catch (err) {}
+  return blob;
+}
+
+function getFormDisplayTitle(form, config, idx) {
+  var title = config.title;
+  if (!title || title.trim() === "") {
+    title = form.getTitle().replace(/\r?\n/g, " ").trim();
+  }
+  if (!title || title.trim() === "") {
+    title = "Опросник " + (idx + 1);
+  }
+  return title;
+}
+
+function bytesToHex(bytes) {
+  return bytes.map(function(byte) {
+    var value = byte;
+    if (value < 0) value += 256;
+    return ("0" + value.toString(16)).slice(-2);
+  }).join("");
+}
+
+function buildFormRevision(form, config, idx) {
+  var title = getFormDisplayTitle(form, config, idx);
+  var parts = [title, String(config.maxDaily)];
+  var items = form.getItems();
+
+  for (var i = 0; i < items.length; i++) {
+    var item = items[i];
+    var type = item.getType();
+    var rawTitle = item.getTitle() || "";
+    parts.push(String(type), rawTitle);
+
+    if (type == FormApp.ItemType.LIST) {
+      parts.push(item.asListItem().getChoices().map(function(choice) { return choice.getValue(); }).join("|"));
+      parts.push(item.asListItem().isRequired() ? "1" : "0");
+    } else if (type == FormApp.ItemType.MULTIPLE_CHOICE) {
+      parts.push(item.asMultipleChoiceItem().getChoices().map(function(choice) { return choice.getValue(); }).join("|"));
+      parts.push(item.asMultipleChoiceItem().isRequired() ? "1" : "0");
+    } else if (type == FormApp.ItemType.SCALE) {
+      var scaleItem = item.asScaleItem();
+      parts.push(String(scaleItem.getLowerBound()), String(scaleItem.getUpperBound()));
+      parts.push(scaleItem.isRequired() ? "1" : "0");
+    } else if (type == FormApp.ItemType.PARAGRAPH_TEXT) {
+      parts.push(item.asParagraphTextItem().isRequired() ? "1" : "0");
+    } else if (type == FormApp.ItemType.TEXT) {
+      parts.push(item.asTextItem().isRequired() ? "1" : "0");
+    } else if (type == FormApp.ItemType.IMAGE) {
+      try {
+        var blob = item.asImageItem().getImage();
+        if (blob) {
+          var digest = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, blob.getBytes());
+          parts.push(blob.getContentType() || "");
+          parts.push(bytesToHex(digest));
+        }
+      } catch (err) {}
+    }
+  }
+
+  var revisionDigest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, parts.join("\n"));
+  return bytesToHex(revisionDigest);
+}
+
 // Умная проверка: обязателен ли вопрос
 function getReqAttr(item, type) {
   try {
@@ -33,6 +117,17 @@ function doGet(e) {
   if (action === "getformcount") {
     return ContentService.createTextOutput(FORMS_CONFIG.length.toString()).setMimeType(ContentService.MimeType.TEXT);
   }
+
+  if (action === "getformmeta") {
+    var metaIdx = parseInt(e.parameter.index);
+    if (isNaN(metaIdx) || metaIdx >= FORMS_CONFIG.length) return ContentService.createTextOutput("ERROR_INDEX").setMimeType(ContentService.MimeType.TEXT);
+
+    var metaConfig = FORMS_CONFIG[metaIdx];
+    var metaForm = FormApp.openById(metaConfig.formId);
+    var metaTitle = getFormDisplayTitle(metaForm, metaConfig, metaIdx);
+    var metaRevision = buildFormRevision(metaForm, metaConfig, metaIdx);
+    return ContentService.createTextOutput(metaTitle + "|||" + metaConfig.maxDaily.toString() + "|||" + metaRevision).setMimeType(ContentService.MimeType.TEXT);
+  }
   
   if (action === "getform") {
     var idx = parseInt(e.parameter.index);
@@ -43,15 +138,7 @@ function doGet(e) {
     
     // --- БРОНЕБОЙНОЕ ПОЛУЧЕНИЕ ЗАГОЛОВКА ---
     // 1. Берем из наших настроек (приоритет)
-    var title = config.title;
-    // 2. Если в настройках пусто, пробуем достать из формы
-    if (!title || title.trim() === "") {
-      title = form.getTitle().replace(/\r?\n/g, " ").trim(); 
-    }
-    // 3. Если и там пусто, ставим резервное имя
-    if (!title || title.trim() === "") {
-      title = "Опросник " + (idx + 1);
-    }
+    var title = getFormDisplayTitle(form, config, idx);
     
     var maxDaily = config.maxDaily.toString(); 
     var items = form.getItems();
@@ -76,12 +163,12 @@ function doGet(e) {
           var imageItem = item.asImageItem();
           var blob = imageItem.getImage();
           if (blob) {
-            // Убираем ЛЮБЫЕ переносы строк из картинки
-            var base64Data = Utilities.base64Encode(blob.getBytes()).replace(/\r?\n/g, "");
-            var mimeType = blob.getContentType();
+            var optimizedBlob = optimizeImageBlob(blob);
+            var base64Data = Utilities.base64Encode(optimizedBlob.getBytes()).replace(/\r?\n/g, "");
+            var mimeType = optimizedBlob.getContentType() || blob.getContentType() || "image/png";
             html += "<div style='text-align:center; margin:20px 0;'>";
-            if (rawTitle) html += "<p style='font-weight:bold; margin-bottom:8px; white-space: pre-wrap;'>" + rawTitle.replace(/\n/g, "<br>") + "</p>";
-            html += "<img src='data:" + mimeType + ";base64," + base64Data + "' style='max-width:100%; height:auto; border-radius:12px; box-shadow:0 4px 12px rgba(0,0,0,0.1);' /></div>";
+            if (rawTitle) html += "<p style='font-weight:bold; margin-bottom:8px; white-space: pre-wrap;'>" + escapeHtml(rawTitle).replace(/\n/g, "<br>") + "</p>";
+            html += "<img loading='lazy' src='data:" + mimeType + ";base64," + base64Data + "' style='display:block; max-width:100%; height:auto; margin:0 auto; border-radius:12px; box-shadow:0 4px 12px rgba(0,0,0,0.1);' /></div>";
           }
         } catch(imgErr) {}
         continue; 
