@@ -9,7 +9,54 @@
 
 FormManager Forms;
 
-// Removed writeHttpBodyToFile and readStringUntilToken
+// Безопасный Stream для записи в LittleFS с периодической отдачей процессорного времени (delay 1),
+// чтобы не вызывать панику Watchdog Timer и не вешать систему на долгих файловых операциях.
+class SafeFileStream : public Stream {
+private:
+    File* _file;
+    size_t _bytesWritten = 0;
+public:
+    SafeFileStream(File* f) : _file(f) {}
+    size_t write(uint8_t c) override {
+        _bytesWritten++;
+        if (_bytesWritten % 4096 == 0) delay(1); 
+        return _file->write(c);
+    }
+    size_t write(const uint8_t *buffer, size_t size) override {
+        _bytesWritten += size;
+        if (_bytesWritten % 4096 < size) delay(1);
+        return _file->write(buffer, size);
+    }
+    int available() override { return _file->available(); }
+    int read() override { return _file->read(); }
+    int peek() override { return _file->peek(); }
+    void flush() override { _file->flush(); }
+};
+
+static String readStringUntilToken(File& file, const char* token) {
+    String result = "";
+    result.reserve(128); // Prevent heap fragmentation
+    int tokenLen = strlen(token);
+    int matchIdx = 0;
+    while(file.available()) {
+        char c = file.read();
+        if (c == token[matchIdx]) {
+            matchIdx++;
+            if (matchIdx == tokenLen) {
+                return result;
+            }
+        } else {
+            if (matchIdx > 0) {
+                for (int i=0; i<matchIdx; i++) result += token[i];
+                matchIdx = 0;
+            }
+            if (c == token[0]) matchIdx = 1;
+            else result += c;
+        }
+        if (result.length() > 512) return result; 
+    }
+    return result;
+}
 
 void FormManager::begin() {
     if(!LittleFS.begin(true)){
@@ -66,18 +113,23 @@ bool FormManager::fetchFromServer() {
     Logger.add("Очистка памяти перед загрузкой...");
     File root = LittleFS.open("/");
     if (root) {
+        std::vector<String> filesToDelete;
         File file = root.openNextFile();
         while (file) {
             String fName = file.name();
-            file.close();
             if (!fName.startsWith("/")) fName = "/" + fName;
             if (fName.startsWith("/raw_")) {
-                LittleFS.remove(fName);
+                filesToDelete.push_back(fName);
             }
-            esp_task_wdt_reset();
+            file.close();
             file = root.openNextFile();
         }
         root.close();
+        
+        for (const String& fName : filesToDelete) {
+            LittleFS.remove(fName);
+            delay(1); // небольшая пауза, чтобы не вешать систему
+        }
     }
 
     int loadedCount = 0;
@@ -95,9 +147,9 @@ bool FormManager::fetchFromServer() {
 
         formHttp.begin(formClient, Config.cloud_url + "?action=getForm&index=" + String(i));
         formHttp.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS); 
-        formHttp.setTimeout(45000);
+        formHttp.setTimeout(8000); // 8 секунд вместо 45, чтобы не висело вечно, если Cloudflare не закроет сокет
         formHttp.setReuse(false);
-        formHttp.useHTTP10(true);
+        formHttp.useHTTP10(false); // ВАЖНО: HTTP/1.1 необходим для правильного парсинга Chunked Transfer Encoding
         formHttp.addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
         formHttp.addHeader("Connection", "close");
 
@@ -106,14 +158,16 @@ bool FormManager::fetchFromServer() {
             String fileName = "/raw_" + String(i) + ".txt";
             File file = LittleFS.open(fileName, FILE_WRITE);
             if (file) {
-                formHttp.writeToStream(&file);
+                // writeToStream нативно парсит chunked-ответы, а SafeFileStream не дает зависнуть Watchdog'у
+                SafeFileStream safeStream(&file);
+                formHttp.writeToStream(&safeStream);
                 file.close();
                 
                 Logger.add("Парсинг...");
                 file = LittleFS.open(fileName, FILE_READ);
                 if (file) {
-                    String title = file.readStringUntil('|'); file.read(); file.read();
-                    String maxDailyStr = file.readStringUntil('|'); file.read(); file.read();
+                    String title = readStringUntilToken(file, "|||");
+                    String maxDailyStr = readStringUntilToken(file, "|||");
                     
                     title.trim(); maxDailyStr.trim();
                     if (title.length() == 0) title = "Опросник " + String(i + 1);
