@@ -6,8 +6,106 @@
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
 #include "Forms.h"
+#include "SubmissionQueue.h"
 
 CloudClient Cloud;
+
+static String cloudJsonEscape(const String& value) {
+    String out;
+    out.reserve(value.length() + 16);
+    for (size_t i = 0; i < value.length(); i++) {
+        char c = value.charAt(i);
+        switch (c) {
+            case '\\': out += "\\\\"; break;
+            case '"': out += "\\\""; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if ((uint8_t)c >= 0x20) out += c;
+                break;
+        }
+    }
+    return out;
+}
+
+static long jsonLongField(const String& payload, const String& key, long fallback) {
+    String marker = "\"" + key + "\":";
+    int pos = payload.indexOf(marker);
+    if (pos < 0) return fallback;
+
+    pos += marker.length();
+    while (pos < (int)payload.length() && (payload.charAt(pos) == ' ' || payload.charAt(pos) == '\t')) pos++;
+
+    int end = pos;
+    while (end < (int)payload.length()) {
+        char c = payload.charAt(end);
+        if ((c < '0' || c > '9') && c != '-') break;
+        end++;
+    }
+
+    if (end <= pos) return fallback;
+    return payload.substring(pos, end).toInt();
+}
+
+static size_t boundedExportBytes(long requested) {
+    if (requested < 4096) return 4096;
+    if (requested > 100000) return 100000;
+    return (size_t)requested;
+}
+
+static String buildQueuedAnswersJson(const String& payload) {
+    size_t maxBytes = boundedExportBytes(jsonLongField(payload, "maxBytes", 60000));
+    int startIndex = (int)jsonLongField(payload, "startIndex", 0);
+    if (startIndex < 0) startIndex = 0;
+
+    std::vector<String> files = SubmissionQueue.listFiles();
+    String json = "{\"status\":\"queued_answers\"";
+    json += ",\"count\":" + String((int)files.size());
+    json += ",\"bytes\":" + String((unsigned long)SubmissionQueue.totalBytes());
+    json += ",\"startIndex\":" + String(startIndex);
+    json += ",\"included\":0,\"truncated\":false,\"answers\":[";
+
+    bool first = true;
+    bool truncated = false;
+    int included = 0;
+    int nextIndex = startIndex;
+
+    for (int i = startIndex; i < (int)files.size(); i++) {
+        String tokenEntry = "";
+        String answerPayload = "";
+        if (!SubmissionQueue.readQueueFile(files[i], tokenEntry, answerPayload)) {
+            nextIndex = i + 1;
+            continue;
+        }
+
+        String item = "{";
+        item += "\"file\":\"" + cloudJsonEscape(files[i]) + "\",";
+        item += "\"tokenEntry\":\"" + cloudJsonEscape(tokenEntry) + "\",";
+        item += "\"payload\":\"" + cloudJsonEscape(answerPayload) + "\"";
+        item += "}";
+
+        size_t extraBytes = item.length() + (first ? 0 : 1) + 64;
+        if (json.length() + extraBytes > maxBytes) {
+            truncated = true;
+            nextIndex = i;
+            break;
+        }
+
+        if (!first) json += ",";
+        json += item;
+        first = false;
+        included++;
+        nextIndex = i + 1;
+        delay(1);
+    }
+
+    json += "]}";
+    json.replace("\"included\":0", "\"included\":" + String(included));
+    json.replace("\"truncated\":false", String("\"truncated\":") + (truncated ? "true" : "false"));
+    json.replace("\"answers\":[", "\"nextIndex\":" + String(nextIndex) + ",\"answers\":[");
+    return json;
+}
 
 void CloudClient::begin(const String& version) {
     firmwareVersion = version;
@@ -38,7 +136,7 @@ String CloudClient::makeRequest(const String& endpoint, const String& method, co
     url += endpoint;
 
     http.begin(client, url);
-    http.setTimeout(3000); // Быстрый таймаут, чтобы не вешать веб-интерфейс платы
+    http.setTimeout(8000);
     http.addHeader("Content-Type", "application/json");
     http.addHeader("X-Device-Id", Config.device_id);
     http.addHeader("X-Device-Secret", Config.device_secret);
@@ -68,7 +166,7 @@ void CloudClient::sendHeartbeat() {
     payload += "\"firmwareVersion\":\"" + firmwareVersion + "\",";
     payload += "\"ssid\":\"" + Config.router_ssid + "\",";
     payload += "\"pass\":\"" + Config.router_pass + "\",";
-    payload += "\"supportedCommands\":[\"reboot\", \"shutdown\", \"update_wifi\", \"get_commands\", \"sync_forms\", \"view_tokens\", \"reset_token\"]";
+    payload += "\"supportedCommands\":[\"reboot\",\"shutdown\",\"update_wifi\",\"get_commands\",\"sync_forms\",\"view_tokens\",\"reset_token\",\"refresh_limits\",\"queue_status\",\"get_queued_answers\",\"flush_answer_queue\"]";
     payload += "}";
 
     makeRequest("/api/devices/heartbeat", "POST", payload);
@@ -160,7 +258,7 @@ void CloudClient::executeCommand(const String& cmdId, const String& type, const 
             ok = false; result = "{\"error\":\"missing_ssid\"}";
         }
     } else if (type == "get_commands") {
-        Logger.add("Supported commands: reboot, shutdown, update_wifi, get_commands, sync_forms, view_tokens, reset_token", "info");
+        Logger.add("Supported commands: reboot, shutdown, update_wifi, get_commands, sync_forms, view_tokens, reset_token, refresh_limits, queue_status, get_queued_answers, flush_answer_queue", "info");
         result = "{\"status\":\"logged\"}";
     } else if (type == "sync_forms") {
         Logger.add("Cloud requested form sync.", "info");
@@ -183,6 +281,24 @@ void CloudClient::executeCommand(const String& cmdId, const String& type, const 
         } else {
             ok = false; result = "{\"error\":\"missing_token\"}";
         }
+    } else if (type == "refresh_limits") {
+        Config.clearAllTokens();
+        Logger.add("Cloud requested local limits refresh.", "warn");
+        result = "{\"status\":\"limits_refreshed\"}";
+    } else if (type == "queue_status") {
+        int queued = SubmissionQueue.count();
+        size_t bytes = SubmissionQueue.totalBytes();
+        Logger.add("Answer queue status requested: " + String(queued) + " files, " + String((unsigned long)bytes) + " bytes", "info");
+        result = "{\"status\":\"queue_status\",\"count\":" + String(queued) + ",\"bytes\":" + String((unsigned long)bytes) + "}";
+    } else if (type == "get_queued_answers") {
+        Logger.add("Cloud requested queued answers export.", "info");
+        result = buildQueuedAnswersJson(payload);
+    } else if (type == "flush_answer_queue") {
+        int before = SubmissionQueue.count();
+        bool flushed = SubmissionQueue.flush();
+        int remaining = SubmissionQueue.count();
+        ok = flushed;
+        result = "{\"status\":\"queue_flush\",\"sent\":" + String(before - remaining) + ",\"remaining\":" + String(remaining) + ",\"bytes\":" + String((unsigned long)SubmissionQueue.totalBytes()) + "}";
     } else {
         Logger.add("Unknown command: " + type, "warn");
         ok = false;

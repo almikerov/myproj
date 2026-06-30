@@ -9,6 +9,8 @@ const JSON_HEADERS = {
     "Content-Type, Authorization, X-Device-Id, X-Device-Secret, X-Bootstrap-Token",
 };
 
+const DEVICE_ONLINE_WINDOW_MS = 45000;
+
 export default {
   async fetch(request, env, ctx) {
     try {
@@ -112,7 +114,7 @@ async function handleAdminApi(request, env, url) {
          FROM devices
         ORDER BY COALESCE(last_seen_at, created_at) DESC`
     ).all();
-    return json({ devices: result.results || [] });
+    return json({ devices: (result.results || []).map(withRuntimeDeviceStatus) });
   }
 
   if (url.pathname === "/api/admin/devices" && request.method === "DELETE") {
@@ -131,12 +133,11 @@ async function handleAdminApi(request, env, url) {
       const hash = await hashDeviceSecret(deviceId, body.secret.trim());
       await env.DB.prepare(
         `INSERT INTO devices(device_id, name, secret_hash, model, firmware_version, status, created_at, updated_at)
-         VALUES(?, ?, ?, ?, ?, 'active', ?, ?)
+         VALUES(?, ?, ?, ?, 'unknown', 'active', ?, ?)
          ON CONFLICT(device_id) DO UPDATE SET
            name=excluded.name,
            secret_hash=excluded.secret_hash,
            model=excluded.model,
-           firmware_version=excluded.firmware_version,
            status='active',
            updated_at=excluded.updated_at`
       )
@@ -145,7 +146,6 @@ async function handleAdminApi(request, env, url) {
           optionalString(body.name, deviceId),
           hash,
           optionalString(body.model, "esp32"),
-          optionalString(body.firmwareVersion, "unknown"),
           now,
           now
         )
@@ -155,8 +155,12 @@ async function handleAdminApi(request, env, url) {
       if (!existing) throw new HttpError(400, "secret_required_for_new_device");
       
       await env.DB.prepare(
-        `UPDATE devices SET firmware_version = ?, updated_at = ? WHERE device_id = ?`
-      ).bind(optionalString(body.firmwareVersion, "unknown"), now, deviceId).run();
+        `UPDATE devices
+            SET name = COALESCE(?, name),
+                model = COALESCE(?, model),
+                updated_at = ?
+          WHERE device_id = ?`
+      ).bind(optionalNullableString(body.name), optionalNullableString(body.model), now, deviceId).run();
     }
 
     return json({ ok: true, deviceId });
@@ -299,12 +303,11 @@ async function handleDeviceApi(request, env, url) {
 
     await env.DB.prepare(
       `INSERT INTO devices(device_id, name, secret_hash, model, firmware_version, status, created_at, updated_at)
-       VALUES(?, ?, ?, ?, ?, 'active', ?, ?)
+       VALUES(?, ?, ?, ?, 'unknown', 'active', ?, ?)
        ON CONFLICT(device_id) DO UPDATE SET
          name=excluded.name,
          secret_hash=excluded.secret_hash,
          model=excluded.model,
-         firmware_version=excluded.firmware_version,
          status='active',
          updated_at=excluded.updated_at`
     )
@@ -313,7 +316,6 @@ async function handleDeviceApi(request, env, url) {
         optionalString(body.name, deviceId),
         hash,
         optionalString(body.model, "esp32"),
-        optionalString(body.firmwareVersion, "unknown"),
         now,
         now
       )
@@ -573,6 +575,24 @@ function parseStoredJson(value) {
   }
 }
 
+function withRuntimeDeviceStatus(device) {
+  const lastSeenMs = Date.parse(device.last_seen_at || "");
+  const hasHeartbeat = Number.isFinite(lastSeenMs);
+  const ageMs = hasHeartbeat ? Date.now() - lastSeenMs : Infinity;
+  const runtimeStatus = hasHeartbeat && ageMs <= DEVICE_ONLINE_WINDOW_MS
+    ? "online"
+    : hasHeartbeat
+      ? "offline"
+      : "never_seen";
+
+  return {
+    ...device,
+    runtime_status: runtimeStatus,
+    status_label: runtimeStatus === "never_seen" ? "never seen" : runtimeStatus,
+    heartbeat_age_seconds: hasHeartbeat ? Math.max(0, Math.floor(ageMs / 1000)) : null,
+  };
+}
+
 class HttpError extends Error {
   constructor(status, message) {
     super(message);
@@ -672,7 +692,13 @@ function adminHtml() {
     
     .status { font-weight: 600; padding: 4px 8px; border-radius: 6px; font-size: 12px; display: inline-block; }
     .status.active { background: rgba(16, 185, 129, 0.15); color: var(--ok); border: 1px solid rgba(16, 185, 129, 0.2); }
+    .status.online { background: rgba(16, 185, 129, 0.15); color: var(--ok); border: 1px solid rgba(16, 185, 129, 0.2); }
+    .status.offline { background: rgba(239, 68, 68, 0.15); color: var(--bad); border: 1px solid rgba(239, 68, 68, 0.2); }
+    .status.never_seen { background: rgba(148, 163, 184, 0.12); color: var(--muted); border: 1px solid rgba(148, 163, 184, 0.2); }
     .status.queued { background: rgba(245, 158, 11, 0.15); color: var(--warn); border: 1px solid rgba(245, 158, 11, 0.2); }
+    .status.delivered { background: rgba(59, 130, 246, 0.15); color: var(--accent); border: 1px solid rgba(59, 130, 246, 0.2); }
+    .status.done { background: rgba(16, 185, 129, 0.15); color: var(--ok); border: 1px solid rgba(16, 185, 129, 0.2); }
+    .status.failed { background: rgba(239, 68, 68, 0.15); color: var(--bad); border: 1px solid rgba(239, 68, 68, 0.2); }
     
     .ok { color: var(--ok); }
     .bad { color: var(--bad); }
@@ -730,21 +756,18 @@ function adminHtml() {
       <h2>Register Device</h2>
       <label>Device ID</label><input id="deviceId" placeholder="esp32-kitchen-01">
       <label>Secret</label><input id="deviceSecret" type="password" placeholder="Strong per-device secret">
-      <label>Firmware Version</label><input id="deviceFirmware" value="0.1.0">
       <button id="createDevice" style="margin-top: 16px;">Save Device</button>
       
       <hr>
       <h2>Queue Command</h2>
       <label>Device</label><select id="commandDevice"></select>
       <label>Type</label>
-      <select id="commandType">
+      <input id="commandType" list="commandTypeOptions" value="reboot" placeholder="reboot">
+      <datalist id="commandTypeOptions">
         <option value="reboot">reboot</option>
         <option value="shutdown">shutdown</option>
         <option value="update_wifi">update_wifi</option>
-        <option value="sync_forms">sync_forms</option>
-        <option value="view_tokens">view_tokens</option>
-        <option value="reset_token">reset_token</option>
-      </select>
+      </datalist>
       <label>Payload (JSON)</label><textarea id="commandPayload">{}</textarea>
       <button id="queueCommand" class="warn" style="margin-top: 16px;">Queue Command</button>
       
@@ -760,10 +783,19 @@ function adminHtml() {
           <h2>Fleet Status</h2>
           <div class="table-container">
             <table>
-              <thead><tr><th>ID</th><th>Status</th><th>Firmware</th><th>Wi-Fi Network</th><th>Last Seen</th><th>Actions</th></tr></thead>
+              <thead><tr><th>ID</th><th>Status</th><th>Wi-Fi Network</th><th>Last Seen</th><th>Actions</th></tr></thead>
               <tbody id="devices"></tbody>
             </table>
           </div>
+        </div>
+      </div>
+      <div style="margin-top: 32px;">
+        <h2>Command History</h2>
+        <div class="table-container">
+          <table>
+            <thead><tr><th>Device</th><th>Command</th><th>Status</th><th>Completed</th><th>Result</th></tr></thead>
+            <tbody id="commands"></tbody>
+          </table>
         </div>
       </div>
       <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 32px; margin-bottom: 16px;">
@@ -777,7 +809,7 @@ function adminHtml() {
     </section>
   </main>
   <script>
-    const state = { devices: [], logClearTime: 0, localLogs: [] };
+    const state = { devices: [], commands: [], logClearTime: 0, localLogs: [] };
     const token = document.getElementById("token");
     try { token.value = localStorage.getItem("esp32_admin_token") || ""; } catch(e) {}
 
@@ -799,6 +831,26 @@ function adminHtml() {
       if(!iso) return "never";
       const d = new Date(iso);
       return d.toLocaleString();
+    };
+
+    const defaultCommandTypes = ["reboot", "shutdown", "update_wifi"];
+
+    const parseSupportedCommands = (device) => {
+      try {
+        const parsed = JSON.parse(device && device.supported_commands ? device.supported_commands : "[]");
+        return Array.isArray(parsed) ? parsed.filter(x => typeof x === "string" && x.trim()) : [];
+      } catch(e) {
+        return [];
+      }
+    };
+
+    const updateCommandOptions = () => {
+      const list = document.getElementById("commandTypeOptions");
+      if (!list) return;
+      const selectedId = value("commandDevice");
+      const device = state.devices.find(d => d.device_id === selectedId);
+      const commands = [...new Set([...defaultCommandTypes, ...parseSupportedCommands(device)])];
+      list.innerHTML = commands.map(command => "<option value='" + escAttr(command) + "'>").join("");
     };
 
     window.showError = (error) => { 
@@ -837,6 +889,7 @@ function adminHtml() {
         ]);
         
         state.devices = devices.devices;
+        state.commands = commands.commands;
         renderDevices(devices.devices);
         renderCommands(commands.commands);
         renderLogs(logs.logs);
@@ -847,19 +900,19 @@ function adminHtml() {
 
     const renderDevices = (items) => {
       document.getElementById("devices").innerHTML = items.map(d =>
-        "<tr><td><div style='font-weight:600; color:var(--text);'>" + esc(d.device_id) + "</div></td><td><span class='status " + esc(d.status) + "'>" + esc(d.status) + "</span></td><td>" + esc(d.firmware_version || "") + "</td><td><div style='font-weight:500;'>" + (d.wifi_ssid ? esc(d.wifi_ssid) : "—") + "</div><div class='muted' style='margin-top:4px; font-family:monospace;'>" + (d.wifi_pass ? "***" : "—") + "</div></td><td class='muted'>" + formatDate(d.last_seen_at) + "</td><td><div style='display:flex; gap:4px;'><button class='secondary' onclick='editDevice(\\"" + escAttr(d.device_id) + "\\")' title='Edit' style='padding:4px 8px;'>✏️</button><button class='secondary' onclick='delDevice(\\"" + escAttr(d.device_id) + "\\")' title='Delete' style='padding:4px 8px;'>🗑️</button><button class='secondary' onclick='queue(\\"" + escAttr(d.device_id) + "\\",\\"reboot\\")' title='Reboot' style='padding:4px 8px;'>🔄</button><button class='secondary' onclick='queue(\\"" + escAttr(d.device_id) + "\\",\\"shutdown\\")' title='Sleep/Shutdown' style='padding:4px 8px;'>💤</button></div></td></tr>"
+        "<tr><td><div style='font-weight:600; color:var(--text);'>" + esc(d.device_id) + "</div></td><td><span class='status " + esc(d.runtime_status || "never_seen") + "'>" + esc(d.status_label || "never seen") + "</span></td><td><div style='font-weight:500;'>" + (d.wifi_ssid ? esc(d.wifi_ssid) : "&mdash;") + "</div><div class='muted' style='margin-top:4px; font-family:monospace;'>" + (d.wifi_pass ? "***" : "&mdash;") + "</div></td><td class='muted'>" + formatDate(d.last_seen_at) + "</td><td><div style='display:flex; gap:4px; flex-wrap:wrap;'><button class='secondary' onclick='editDevice(\\"" + escAttr(d.device_id) + "\\")' title='Edit device' style='padding:4px 8px;'>Edit</button><button class='secondary' onclick='delDevice(\\"" + escAttr(d.device_id) + "\\")' title='Delete device' style='padding:4px 8px;'>Delete</button></div></td></tr>"
       ).join("");
-      
+
       document.getElementById("commandDevice").innerHTML = items.map(d =>
         "<option value='" + escAttr(d.device_id) + "'>" + esc(d.device_id) + "</option>"
       ).join("");
+      updateCommandOptions();
     };
 
     window.editDevice = (id) => {
       const d = state.devices.find(x => x.device_id === id);
       if(!d) return;
       document.getElementById("deviceId").value = d.device_id;
-      document.getElementById("deviceFirmware").value = d.firmware_version;
       document.getElementById("deviceSecret").value = "";
       if (d.wifi_ssid) {
         const ssid = prompt("Set new Wi-Fi SSID for " + d.device_id, d.wifi_ssid);
@@ -883,16 +936,96 @@ function adminHtml() {
       }
     };
 
-    window.queue = (id, type) => {
+    window.queue = (id, type, payload = {}) => {
       api("/api/admin/commands", { method: "POST", body: JSON.stringify({
-        deviceId: id, type: type, payload: {}
+        deviceId: id, type: type, payload: payload
       }) }).then(() => {
         state.localLogs.push({ created_at: new Date().toISOString(), device_id: id, level: "CMD", message: "Queued: " + type });
         refresh();
       }).catch(showError);
     };
 
-    const renderCommands = (items) => {};
+    const parseCommandAck = (command) => {
+      try { return JSON.parse(command.result || "{}"); } catch(e) { return {}; }
+    };
+
+    const commandResultSummary = (command) => {
+      if (!command.result) return "";
+      const ack = parseCommandAck(command);
+      const result = ack.result || {};
+      if (command.type === "queue_status" || command.type === "get_queued_answers" || command.type === "flush_answer_queue") {
+        const count = result.count !== undefined ? result.count : result.remaining;
+        const parts = [];
+        if (count !== undefined) parts.push("answers: " + count);
+        if (result.bytes !== undefined) parts.push("bytes: " + result.bytes);
+        if (result.sent !== undefined) parts.push("sent: " + result.sent);
+        if (result.truncated) parts.push("truncated");
+        return parts.join(", ") || JSON.stringify(result);
+      }
+      return JSON.stringify(result);
+    };
+
+    const renderCommands = (items) => {
+      state.commands = items || [];
+      const el = document.getElementById("commands");
+      if (!el) return;
+      if (!state.commands.length) {
+        el.innerHTML = "<tr><td colspan='5' class='muted'>No commands yet</td></tr>";
+        return;
+      }
+      el.innerHTML = state.commands.slice(0, 50).map(c => {
+        const canDownload = c.type === "get_queued_answers" && c.status === "done" && c.result;
+        const download = canDownload ? "<button class='secondary' onclick='downloadQueuedAnswers(\\"" + escAttr(c.command_id) + "\\")' style='padding:4px 8px;'>Download</button>" : "";
+        return "<tr><td>" + esc(c.device_id) + "</td><td>" + esc(c.type) + "</td><td><span class='status " + esc(c.status) + "'>" + esc(c.status) + "</span></td><td class='muted'>" + formatDate(c.completed_at || c.delivered_at || c.created_at) + "</td><td><div style='display:flex; gap:8px; align-items:center; flex-wrap:wrap;'><span class='muted'>" + esc(commandResultSummary(c)) + "</span>" + download + "</div></td></tr>";
+      }).join("");
+    };
+
+    const decodePayload = (payload) => {
+      return String(payload || "").split("&").filter(Boolean).map(part => {
+        const eq = part.indexOf("=");
+        const key = eq >= 0 ? part.slice(0, eq) : part;
+        const value = eq >= 0 ? part.slice(eq + 1) : "";
+        const decode = (s) => {
+          try { return decodeURIComponent(String(s).replace(/\\+/g, " ")); } catch(e) { return s; }
+        };
+        return decode(key) + ": " + decode(value);
+      }).join("\\n");
+    };
+
+    window.downloadQueuedAnswers = (commandId) => {
+      const command = state.commands.find(c => c.command_id === commandId);
+      if (!command) return alert("Command result not found");
+      const ack = parseCommandAck(command);
+      const result = ack.result || {};
+      const answers = Array.isArray(result.answers) ? result.answers : [];
+      if (!answers.length) return alert("There are no queued answers in this result");
+
+      let text = "Queued answers from " + command.device_id + "\\n";
+      text += "Created: " + formatDate(command.created_at) + "\\n";
+      text += "Exported: " + formatDate(command.completed_at) + "\\n";
+      text += "Total answers: " + answers.length + "\\n";
+      text += "Total bytes on device: " + (result.bytes || 0) + "\\n";
+      text += result.truncated ? "Warning: export was truncated by size limit.\\n" : "";
+      text += "\\n";
+
+      answers.forEach((answer, index) => {
+        text += "===== Answer " + (index + 1) + " =====\\n";
+        text += "File: " + (answer.file || "") + "\\n";
+        text += "Token: " + (answer.tokenEntry || "") + "\\n";
+        text += decodePayload(answer.payload || "") + "\\n\\n";
+      });
+
+      const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = "queued_answers_" + command.device_id + "_" + Date.now() + ".txt";
+      document.body.appendChild(link);
+      link.click();
+      setTimeout(() => {
+        URL.revokeObjectURL(link.href);
+        link.remove();
+      }, 500);
+    };
 
     const renderLogs = (items) => {
       const logsEl = document.getElementById("logs");
@@ -921,8 +1054,7 @@ function adminHtml() {
     if (btnCreate) btnCreate.onclick = async () => {
       try {
         await api("/api/admin/devices", { method: "POST", body: JSON.stringify({
-          deviceId: value("deviceId"), secret: value("deviceSecret"),
-          firmwareVersion: value("deviceFirmware")
+          deviceId: value("deviceId"), secret: value("deviceSecret")
         }) });
         await refresh();
       } catch(e) { alert(e.message); }
@@ -974,15 +1106,22 @@ function adminHtml() {
     
     const cmdPayloads = {
       update_wifi: "{\\n  \\\"ssid\\\": \\\"WIFI_NAME\\\",\\n  \\\"pass\\\": \\\"WIFI_PASSWORD\\\"\\n}",
-      sync_forms: "{\\n  \\\"form_id\\\": 12345\\n}"
+      sync_forms: "{\\n  \\\"form_id\\\": 12345\\n}",
+      reset_token: "{\\n  \\\"token\\\": \\\"TOKEN_TO_RESET\\\"\\n}",
+      get_queued_answers: "{\\n  \\\"maxBytes\\\": 120000\\n}"
     };
     const cType = document.getElementById("commandType");
     if (cType) {
-      cType.onchange = (e) => {
+      cType.oninput = (e) => {
         const p = cmdPayloads[e.target.value] || "{}";
         const el = document.getElementById("commandPayload");
         if (el) el.value = p;
       };
+    }
+
+    const commandDeviceEl = document.getElementById("commandDevice");
+    if (commandDeviceEl) {
+      commandDeviceEl.onchange = updateCommandOptions;
     }
     
     try {
