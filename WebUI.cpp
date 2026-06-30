@@ -3,9 +3,11 @@
 #include "Logger.h"
 #include "ESPNetwork.h"
 #include "Forms.h"
+#include "SubmissionQueue.h"
 #include <LittleFS.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <ctype.h>
 
 WebUIManager WebUI;
 
@@ -25,6 +27,90 @@ static String jsonEscape(const String& input) {
     return out;
 }
 
+static String htmlEscape(const String& input) {
+    String out = "";
+    out.reserve(input.length() + 16);
+    for (unsigned int i = 0; i < input.length(); i++) {
+        char c = input[i];
+        if (c == '&') out += "&amp;";
+        else if (c == '<') out += "&lt;";
+        else if (c == '>') out += "&gt;";
+        else if (c == '"') out += "&quot;";
+        else if (c == '\'') out += "&#39;";
+        else out += c;
+    }
+    return out;
+}
+
+static int hexValue(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static String decodeFormComponent(const String& input) {
+    String out = "";
+    out.reserve(input.length());
+    for (unsigned int i = 0; i < input.length(); i++) {
+        char c = input[i];
+        if (c == '+') {
+            out += ' ';
+        } else if (c == '%' && i + 2 < input.length()) {
+            int hi = hexValue(input[i + 1]);
+            int lo = hexValue(input[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out += (char)((hi << 4) | lo);
+                i += 2;
+            } else {
+                out += c;
+            }
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+static String payloadToText(const String& payload) {
+    String out = "";
+    int start = 0;
+    while (start <= (int)payload.length()) {
+        int amp = payload.indexOf('&', start);
+        if (amp < 0) amp = payload.length();
+        String pair = payload.substring(start, amp);
+        int eq = pair.indexOf('=');
+        String key = eq >= 0 ? pair.substring(0, eq) : pair;
+        String value = eq >= 0 ? pair.substring(eq + 1) : "";
+        out += decodeFormComponent(key) + ": " + decodeFormComponent(value) + "\n";
+        if (amp >= (int)payload.length()) break;
+        start = amp + 1;
+    }
+    return out;
+}
+
+static String payloadToHtml(const String& payload) {
+    String out = "<table style='width:100%; border-collapse:collapse; margin-top:10px;'>";
+    int start = 0;
+    while (start <= (int)payload.length()) {
+        int amp = payload.indexOf('&', start);
+        if (amp < 0) amp = payload.length();
+        String pair = payload.substring(start, amp);
+        int eq = pair.indexOf('=');
+        String key = eq >= 0 ? pair.substring(0, eq) : pair;
+        String value = eq >= 0 ? pair.substring(eq + 1) : "";
+        out += "<tr><td style='border:1px solid #ddd; padding:8px; font-weight:bold; width:35%; vertical-align:top;'>";
+        out += htmlEscape(decodeFormComponent(key));
+        out += "</td><td style='border:1px solid #ddd; padding:8px; white-space:pre-wrap;'>";
+        out += htmlEscape(decodeFormComponent(value));
+        out += "</td></tr>";
+        if (amp >= (int)payload.length()) break;
+        start = amp + 1;
+    }
+    out += "</table>";
+    return out;
+}
+
 void WebUIManager::begin() {
     const char * headerKeys[] = {"Cookie", "Host"};
     server.collectHeaders(headerKeys, 2);
@@ -34,10 +120,12 @@ void WebUIManager::begin() {
     server.on("/logout", [this]() { handleLogout(); });
     server.on("/change_pass", HTTP_POST, [this]() { handleChangePass(); });
     server.on("/form", [this]() { handleForm(); });
-    server.on("/form_body", [this]() { handleFormBody(); });
     server.on("/submit", HTTP_POST, [this]() { handleSubmit(); });
     server.on("/admin", [this]() { handleAdmin(); });
     server.on("/progress", [this]() { handleProgress(); });
+    server.on("/queue_view", [this]() { handleQueueView(); });
+    server.on("/queue_download", [this]() { handleQueueDownload(); });
+    server.on("/queue_flush", [this]() { handleQueueFlush(); });
     server.on("/save_settings", HTTP_POST, [this]() { handleSaveSettings(); });
     server.on("/update", [this]() { handleUpdate(); });
     server.on("/reboot", [this]() { handleReboot(); });
@@ -136,24 +224,7 @@ void WebUIManager::handleRoot() {
         }
     }
     content += "</div></div>";
-    String prefetchUrls = "";
-    for (int i = 0; i < Forms.formCount; i++) {
-        bool ready = i < (int)Forms.formReady.size() && Forms.formReady[i];
-        if (!ready) continue;
-        String url = "/form_body?id=" + String(i);
-        if (i < (int)Forms.formRevisions.size() && Forms.formRevisions[i].length() > 0) {
-            url += "&r=" + Forms.urlEncode(Forms.formRevisions[i]);
-        }
-        if (prefetchUrls.length() > 0) prefetchUrls += ",";
-        prefetchUrls += "'" + url + "'";
-    }
-    if (prefetchUrls.length() > 0) {
-        content += "<script>window.addEventListener('load',()=>setTimeout(()=>{let q=[" + prefetchUrls + "],i=0;function next(){if(i>=q.length)return;fetch(q[i++],{cache:'force-cache'}).finally(()=>setTimeout(next,250));}next();},1200));</script>";
-    }
-    content += "<div id='progressBox' style='display:block; max-width:450px; margin:14px auto 0; background:white; border:1px solid #e3e7ea; border-radius:8px; padding:12px; box-sizing:border-box;'><div id='progressText' style='font-weight:bold; margin-bottom:8px;'>Загрузка</div><div style='height:12px; background:#edf1f5; border-radius:99px; overflow:hidden;'><div id='progressBar' style='height:100%; width:0%; background:#1a73e8; transition:width .25s;'></div></div><div id='progressMeta' style='font-size:12px; color:#5f6368; margin-top:8px;'></div></div>";
-    
     content += "<div style='text-align:center; margin-top:30px; margin-bottom:20px; padding:20px;'><span onclick=\"let n=Date.now(); if(n-(this.l||0)<600) window.location.href='/admin'; this.l=n;\" style='color:#bdc3c7; font-size:12px; letter-spacing:1px; cursor:pointer;'>АДМИН-ПАНЕЛЬ</span></div>";
-    content += "<script>function bfmt(n){if(!n)return '';if(n>1048576)return (n/1048576).toFixed(1)+' MB';return Math.round(n/1024)+' KB';}function upd(){fetch('/progress',{cache:'no-store'}).then(r=>r.json()).then(s=>{let p=Math.max(0,Math.min(100,s.percent||0));document.getElementById('progressBar').style.width=p+'%';document.getElementById('progressText').textContent=(s.message||'')+' - '+p+'%';let m='Готово '+(s.ready||0)+' из '+(s.forms||0);if(s.totalBytes)m+=' | '+bfmt(s.bytes)+' из '+bfmt(s.totalBytes);else if(s.bytes)m+=' | '+bfmt(s.bytes);if(s.images)m+=' | картинки '+(s.image||0)+' из '+s.images;document.getElementById('progressMeta').textContent=m;if(s.log!==undefined){let t=document.getElementById('syslog');t.value=s.log;}}).catch(()=>{});}setInterval(upd,1000);upd();</script>";
     content += "</body></html>";
     server.send(200, "text/html", content);
 }
@@ -232,7 +303,13 @@ void WebUIManager::handleForm() {
         server.send(404, "text/plain", "Форма не найдена"); return;
     }
 
-    if (id >= (int)Forms.formReady.size() || !Forms.formReady[id]) {
+    if (id < (int)Forms.formReady.size() && Forms.formReady[id] &&
+        (id >= (int)Forms.formHtmlCache.size() || Forms.formHtmlCache[id].length() == 0)) {
+        Forms.cacheFormHtml(id);
+    }
+
+    if (id >= (int)Forms.formReady.size() || !Forms.formReady[id] ||
+        id >= (int)Forms.formHtmlCache.size() || Forms.formHtmlCache[id].length() == 0) {
         server.send(503, "text/html", "<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'></head><body style='font-family:sans-serif;text-align:center;padding:40px;'><h2>Опрос еще загружается</h2><button onclick=\"window.location.href='/'\" style='padding:14px 20px;'>В меню</button></body></html>");
         return;
     }
@@ -254,61 +331,22 @@ void WebUIManager::handleForm() {
         String fHead = "<div id='f" + String(id) + "' class='form-block'>";
         fHead += "<div class='top-token'>Ваш токен: <b>" + t + "</b></div>";
         fHead += "<h2>" + Forms.formTitles[id] + "</h2>";
-        fHead += "<form data-ready='0' onsubmit='if(this.dataset.ready!=\"1\"){return false;} sendData(event, \"f" + String(id) + "\")'>";
+        fHead += "<form onsubmit='sendData(event, \"f" + String(id) + "\")'>";
         fHead += "<input type='hidden' name='token' value='" + t + "'><input type='hidden' name='form_index' value='" + String(id) + "'>";
-        fHead += "<div id='formBody'><div class='loader'></div><p style='text-align:center;color:#5f6368;'>Загружаем вопросы...</p></div>";
         server.sendContent(fHead);
 
+        server.sendContent(Forms.formHtmlCache[id]);
 
         String btnColor = "btn";
         if (id % 3 == 1) btnColor = "btn btn-green"; if (id % 3 == 2) btnColor = "btn btn-orange";
-        String bodyUrl = "/form_body?id=" + String(id);
-        if (id < (int)Forms.formRevisions.size() && Forms.formRevisions[id].length() > 0) {
-            bodyUrl += "&r=" + Forms.urlEncode(Forms.formRevisions[id]);
-        }
         String fTail = "<button type='submit' class='" + btnColor + "'>ОТПРАВИТЬ</button></form></div>";
         fTail += "<div id='load' style='display:none; text-align:center;'><h2>Отправка...</h2><div class='loader'></div></div>";
         fTail += "<div id='res' style='display:none; text-align:center;'><div id='res-msg'></div><button class='btn btn-gray' onclick=\"window.location.href='/'\">В меню</button></div>";
-        fTail += "<script>(function(){var body=document.getElementById('formBody');var form=document.querySelector('#f" + String(id) + " form');var btn=form.querySelector('button[type=submit]');btn.disabled=true;btn.style.opacity='.55';fetch('" + bodyUrl + "',{cache:'force-cache'}).then(r=>{if(!r.ok)throw new Error('load');return r.text();}).then(html=>{body.innerHTML=html;if(window.initLazyImages)initLazyImages(body);form.dataset.ready='1';btn.disabled=false;btn.style.opacity='1';}).catch(()=>{body.innerHTML=\"<p style='color:#e74c3c;text-align:center;'>Не удалось загрузить вопросы. Вернитесь назад и откройте опрос снова.</p>\";});})();</script>";
         server.sendContent(fTail);
     }
     
     server.sendContent("</div></body></html>");
     server.sendContent(""); 
-}
-
-void WebUIManager::handleFormBody() {
-    String idStr = server.arg("id");
-    int id = idStr.toInt();
-
-    if (id < 0 || id >= Forms.formCount || id >= (int)Forms.formReady.size() || !Forms.formReady[id]) {
-        server.sendHeader("Cache-Control", "no-store");
-        server.send(404, "text/plain", "Form body not found");
-        return;
-    }
-
-    File file = LittleFS.open("/raw_" + String(id) + ".txt", FILE_READ);
-    if (!file) {
-        server.sendHeader("Cache-Control", "no-store");
-        server.send(404, "text/plain", "Form file not found");
-        return;
-    }
-
-    file.seek(Forms.formHtmlOffsets[id]);
-    server.sendHeader("Cache-Control", "private, max-age=900");
-    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-    server.send(200, "text/html", "");
-
-    char buf[1025];
-    while (file.available()) {
-        size_t len = file.read((uint8_t*)buf, 1024);
-        buf[len] = '\0';
-        server.sendContent(buf);
-        delay(1);
-    }
-
-    file.close();
-    server.sendContent("");
 }
 
 void WebUIManager::handleSubmit() {
@@ -327,50 +365,23 @@ void WebUIManager::handleSubmit() {
     }
 
     Logger.add("--- НАЧАЛО: Отправка ответов ---");
-    
-    WiFiClientSecure client;
-    client.setInsecure();
-    HTTPClient http; 
-    
-    http.begin(client, Config.cloud_url); 
-    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS); 
-    http.setTimeout(30000); 
-    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-    http.addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
-    
-    const char * headerKeys[] = {"Location"}; 
-    http.collectHeaders(headerKeys, 1);
-    
-    int postCode = http.POST(payload); 
-    Logger.add("HTTP POST Код (Отправка): " + String(postCode));
-    
+
+    String tokenEntry = formIndex + "_" + submittedToken;
     String response = "";
-    if (postCode == 302 || postCode == 303) {
-        String redirectUrl = http.header("Location"); 
-        http.end(); 
-        Logger.add("Сервер перенаправляет...");
-        if (redirectUrl.length() > 0) {
-            http.begin(client, redirectUrl); 
-            http.setTimeout(30000);
-            http.addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+    bool sent = SubmissionQueue.sendNow(payload, response);
+    bool queued = false;
 
-            int getCode = http.GET();
-            Logger.add("HTTP GET Код (Редирект): " + String(getCode));
-            if (getCode == 200) response = http.getString();
-            else response = "SUCCESS";
-        } else response = "SUCCESS";
-    } else if (postCode == 200) {
-        response = "SUCCESS"; 
-    } else {
-        response = "ERROR_CONNECTION";
-        Logger.add("❌ ОШИБКА ОТПРАВКИ: " + http.errorToString(postCode), "error");
+    if (!sent) {
+        queued = SubmissionQueue.enqueue(payload, tokenEntry);
+        if (queued) {
+            response = "SUCCESS";
+            Logger.add("✅ Интернет недоступен. Ответ сохранен на плате и будет отправлен позже.", "warn");
+        }
     }
-    http.end(); 
-    response.trim();
 
-    if (idx < Forms.formCount && response == "SUCCESS") {
-        Config.markTokenUsed(formIndex + "_" + submittedToken);
-        Logger.add("✅ Ответы сохранены.");
+    if (idx < Forms.formCount && (sent || queued)) {
+        Config.markTokenUsed(tokenEntry);
+        Logger.add(sent ? "✅ Ответы отправлены." : "✅ Ответы сохранены локально.");
     } else {
         Logger.add("❌ Итоговый статус: ПРОВАЛ.", "error");
     }
@@ -390,32 +401,64 @@ void WebUIManager::handleAdmin() {
         server.send(302, "text/plain", ""); return;
     }
 
+    if (server.hasArg("reset_token")) {
+        String token = server.arg("reset_token");
+        token.trim();
+        if (token.length() > 0) {
+            Config.freeToken(token);
+            Logger.add("РўРѕРєРµРЅ СЃР±СЂРѕС€РµРЅ РІСЂСѓС‡РЅСѓСЋ: " + token, "warn");
+        }
+        server.sendHeader("Location", "/admin");
+        server.send(302, "text/plain", ""); return;
+    }
+
     if (server.hasArg("reset_all")) {
         Config.clearAllTokens();
         String content = "<html><body style='text-align:center;padding:30px;'><h2>✅ Все лимиты обнулены!</h2><button onclick=\"window.location.href='/admin'\">Назад в админку</button></body></html>";
         server.send(200, "text/html", content); return;
     }
+
+    if (server.hasArg("refresh_limits")) {
+        Config.clearAllTokens();
+        Logger.add("Лимиты прохождений обновлены вручную.", "warn");
+        server.sendHeader("Location", "/admin");
+        server.send(302, "text/plain", ""); return;
+    }
     
     String content = "<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'><style>body{font-family:sans-serif; padding:20px;} input, select{padding:12px; width:100%; box-sizing:border-box; margin-bottom:15px; border-radius:5px; border:1px solid #ccc;} .btn{padding:15px 20px; width:100%; color:white; border:none; border-radius:5px; font-weight:bold; cursor:pointer; margin-bottom:10px;} .btn-blue{background:#1a73e8;} .btn-orange{background:#f39c12;} .btn-red{background:#e74c3c;} .btn-green{background:#2ecc71;} .btn-gray{background:#7f8c8d;}</style></head><body>";
     
-    content += "<button class='btn btn-blue' style='margin-bottom:20px;' onclick=\"window.location.href='/'\">⬅ В ГЛАВНОЕ МЕНЮ</button>";
+    content += "<a class='btn btn-blue' style='margin-bottom:20px;' href='/'>⬅ В ГЛАВНОЕ МЕНЮ</a>";
     content += "<h2>Панель admin</h2>";
     
     String wifiStatus = ESPNetwork.isConnected() ? "<span style='color:#2ecc71;'>✅ Подключено (IP: " + ESPNetwork.getIP() + ")</span>" : "<span style='color:#e74c3c;'>❌ Отключено от сети</span>";
     content += "<div style='background:#f9f9f9; padding:20px; border-radius:10px; margin-bottom:20px;'><h3>Диагностика системы</h3>";
     content += "<p style='font-size:16px; margin-bottom:15px;'>Статус Wi-Fi: " + wifiStatus + "</p>";
-    content += "<div id='progressBox' style='background:#fff; border:1px solid #e3e7ea; border-radius:8px; padding:12px; margin-bottom:12px;'><div id='progressText' style='font-weight:bold; margin-bottom:8px;'>Загрузка не идет</div><div style='height:12px; background:#edf1f5; border-radius:99px; overflow:hidden;'><div id='progressBar' style='height:100%; width:0%; background:#1a73e8; transition:width .25s;'></div></div><div id='progressMeta' style='font-size:12px; color:#5f6368; margin-top:8px;'></div></div>";
     content += "<textarea id='syslog' readonly style='width:100%; height:180px; background:#2c3e50; color:#ecf0f1; font-family:monospace; font-size:13px; padding:10px; border-radius:5px; resize:vertical;'>" + Logger.getSystemLog() + "</textarea>";
     
     content += "<div style='display:flex; gap:10px; margin-top:10px;'>";
     content += "<form action='/admin' method='GET' style='margin:0; flex:1;'><input type='hidden' name='clear_log' value='1'><button type='submit' class='btn btn-gray' style='margin:0;'>ОЧИСТИТЬ ЛОГ</button></form>";
-    content += "<button class='btn btn-blue' style='margin:0; flex:1;' onclick=\"var t=document.getElementById('syslog'); t.select(); document.execCommand('copy'); alert('Лог скопирован!');\">СКОПИРОВАТЬ ЛОГ</button>";
+    content += "<button type='button' class='btn btn-blue' style='margin:0; flex:1;' onclick=\"var t=document.getElementById('syslog'); t.select(); document.execCommand('copy'); alert('Лог скопирован!');\">СКОПИРОВАТЬ ЛОГ</button>";
     content += "</div></div>";
 
     content += "<div style='background:#f9f9f9; padding:20px; border-radius:10px; margin-bottom:20px;'><h3>Управление системой</h3>";
-    content += "<button class='btn btn-green' onclick=\"window.location.href='/update'\">ОБНОВИТЬ ОПРОСНИКИ</button>";
-    content += "<button class='btn btn-gray' onclick=\"if(confirm('Точно перезагрузить плату?')) window.location.href='/reboot'\">ПЕРЕЗАГРУЗИТЬ ПЛАТУ</button>";
+    content += "<form action='/update' method='GET' style='margin:0;'><button type='submit' class='btn btn-green'>ОБНОВИТЬ ОПРОСНИКИ</button></form>";
+    content += "<form action='/reboot' method='GET' style='margin:0;'><button type='submit' class='btn btn-gray' onclick='return confirm(\"Точно перезагрузить плату?\");'>ПЕРЕЗАГРУЗИТЬ ПЛАТУ</button></form>";
+    content += "<form action='/admin' method='GET' style='margin:0;'><input type='hidden' name='refresh_limits' value='1'><button type='submit' class='btn btn-blue' onclick='return confirm(\"Обновить локальные лимиты прохождений?\");'>ОБНОВИТЬ МОИ ЛИМИТЫ</button></form>";
+    content += "<form action='/admin' method='GET' style='margin-top:10px;'><label>Сбросить конкретный токен:</label><input type='text' name='reset_token' placeholder='Например TK-1234'><button type='submit' class='btn btn-orange'>СБРОСИТЬ ТОКЕН</button></form>";
     content += "<form action='/admin' method='GET' style='margin-top:10px;'><input type='hidden' name='reset_all' value='1'><button type='submit' class='btn btn-red' onclick='return confirm(\"Обнулить лимиты вообще ВСЕХ?\");'>ОБНУЛИТЬ ВСЕ ЛИМИТЫ</button></form></div>";
+
+    int queuedAnswers = SubmissionQueue.count();
+    size_t queuedBytes = SubmissionQueue.totalBytes();
+    content += "<div style='background:#f9f9f9; padding:20px; border-radius:10px; margin-bottom:20px;'><h3>Невыгруженные ответы</h3>";
+    content += "<p>В очереди: <b>" + String(queuedAnswers) + "</b>, размер: <b>" + String((unsigned long)(queuedBytes / 1024)) + " KB</b></p>";
+    if (queuedAnswers > 0) {
+        content += "<a class='btn btn-blue' href='/queue_view'>ПОСМОТРЕТЬ ОТВЕТЫ</a>";
+        content += "<a class='btn btn-green' href='/queue_download'>СКАЧАТЬ ОТВЕТЫ</a>";
+        content += "<a class='btn btn-orange' href='/queue_flush'>ОТПРАВИТЬ ОЧЕРЕДЬ СЕЙЧАС</a>";
+    } else {
+        content += "<p style='color:#2ecc71;'>Все ответы выгружены.</p>";
+    }
+    content += "</div>";
     
     content += "<form action='/save_settings' method='POST'>";
     content += "<div style='background:#f9f9f9; padding:20px; border-radius:10px; margin-bottom:20px;'><h3>Настройки Wi-Fi</h3><label>Имя сети базы (AP):</label><input type='text' name='ap_name' value='" + Config.ap_name + "' required><label>Роутер SSID:</label><input type='text' name='router_ssid' value='" + Config.router_ssid + "' required><label>Пароль (пусто если нет):</label><input type='text' name='router_pass' value='" + Config.router_pass + "'></div>";
@@ -427,9 +470,9 @@ void WebUIManager::handleAdmin() {
     content += "<div style='background:#f9f9f9; padding:20px; border-radius:10px; margin-bottom:20px;'><h3>Смена пароля администратора</h3>";
     content += "<form action='/change_pass' method='POST'><input type='password' name='old_pass' placeholder='Старый пароль' required><input type='password' name='new_pass' placeholder='Новый пароль' required><input type='password' name='new_pass2' placeholder='Повторите новый пароль' required><button type='submit' class='btn btn-orange'>ИЗМЕНИТЬ ПАРОЛЬ</button></form></div>";
 
-    content += "<button class='btn btn-gray' onclick=\"window.location.href='/logout'\">ВЫЙТИ ИЗ АДМИНКИ</button>";
+    content += "<script>function upd(){fetch('/progress',{cache:'no-store'}).then(r=>r.json()).then(s=>{let t=document.getElementById('syslog');if(t&&s.log!==undefined)t.value=s.log;}).catch(()=>{});}setInterval(upd,1000);upd();</script>";
+    content += "<a class='btn btn-gray' href='/logout'>ВЫЙТИ ИЗ АДМИНКИ</a>";
     content += "</body></html>";
-    content += "<script>function bfmt(n){if(!n)return '';if(n>1048576)return (n/1048576).toFixed(1)+' MB';return Math.round(n/1024)+' KB';}function upd(){fetch('/progress',{cache:'no-store'}).then(r=>r.json()).then(s=>{let p=Math.max(0,Math.min(100,s.percent||0));document.getElementById('progressBar').style.width=p+'%';document.getElementById('progressText').textContent=(s.message||'')+' - '+p+'%';let m='Готово '+(s.ready||0)+' из '+(s.forms||0);if(s.totalBytes)m+=' | '+bfmt(s.bytes)+' из '+bfmt(s.totalBytes);else if(s.bytes)m+=' | '+bfmt(s.bytes);if(s.images)m+=' | картинки '+(s.image||0)+' из '+s.images;document.getElementById('progressMeta').textContent=m;let t=document.getElementById('syslog');if(t&&s.log!==undefined)t.value=s.log;}).catch(()=>{});}setInterval(upd,1000);upd();</script>";
     server.send(200, "text/html", content);
 }
 
@@ -455,6 +498,7 @@ void WebUIManager::handleProgress() {
     json += ",\"totalBytes\":" + String((unsigned long)Forms.progressTotalBytes);
     json += ",\"image\":" + String(Forms.progressImage);
     json += ",\"images\":" + String(Forms.progressImages);
+    json += ",\"queuedAnswers\":" + String(SubmissionQueue.count());
     json += ",\"updatedMs\":" + String((unsigned long)Forms.progressUpdatedAt);
     if (checkAuth()) {
         json += ",\"log\":\"" + jsonEscape(Logger.getSystemLog()) + "\"";
@@ -463,6 +507,86 @@ void WebUIManager::handleProgress() {
 
     server.sendHeader("Cache-Control", "no-store");
     server.send(200, "application/json", json);
+}
+
+void WebUIManager::handleQueueView() {
+    if (!checkAuth()) { server.sendHeader("Location", "/admin"); server.send(302, "text/plain", ""); return; }
+
+    std::vector<String> files = SubmissionQueue.listFiles();
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "text/html", "");
+    server.sendContent("<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'><style>body{font-family:sans-serif; padding:20px; background:#f4f7f6;} .btn{display:block; width:100%; box-sizing:border-box; text-align:center; padding:14px; border-radius:6px; color:white; text-decoration:none; border:none; margin:8px 0; font-weight:bold;} .blue{background:#1a73e8;} .green{background:#2ecc71;} .gray{background:#7f8c8d;} .card{background:white; padding:16px; margin:14px 0; border-radius:8px; box-shadow:0 2px 8px rgba(0,0,0,0.06);} h2{color:#1a73e8;}</style></head><body>");
+    server.sendContent("<a class='btn gray' href='/admin'>Назад в админку</a><h2>Невыгруженные ответы</h2>");
+
+    if (files.empty()) {
+        server.sendContent("<div class='card'>Очередь пустая. Все ответы выгружены.</div>");
+    } else {
+        server.sendContent("<a class='btn blue' href='/queue_download'>Скачать ответы файлом</a><a class='btn green' href='/queue_flush'>Отправить очередь сейчас</a>");
+        for (int i = 0; i < (int)files.size(); i++) {
+            String tokenEntry = "";
+            String payload = "";
+            server.sendContent("<div class='card'><h3>Ответ #" + String(i + 1) + "</h3><p><b>Файл:</b> " + htmlEscape(files[i]) + "</p>");
+            if (SubmissionQueue.readQueueFile(files[i], tokenEntry, payload)) {
+                server.sendContent("<p><b>Токен/опрос:</b> " + htmlEscape(tokenEntry) + "</p>");
+                server.sendContent(payloadToHtml(payload));
+            } else {
+                server.sendContent("<p style='color:#e74c3c;'>Файл очереди поврежден или не читается.</p>");
+            }
+            server.sendContent("</div>");
+            delay(1);
+        }
+    }
+
+    server.sendContent("</body></html>");
+    server.sendContent("");
+}
+
+void WebUIManager::handleQueueDownload() {
+    if (!checkAuth()) { server.sendHeader("Location", "/admin"); server.send(302, "text/plain", ""); return; }
+
+    std::vector<String> files = SubmissionQueue.listFiles();
+    server.sendHeader("Content-Disposition", "attachment; filename=queued_answers.txt");
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "text/plain; charset=utf-8", "");
+    server.sendContent("Невыгруженные ответы ESP32\n");
+    server.sendContent("Количество: " + String((int)files.size()) + "\n");
+    server.sendContent("Размер: " + String((unsigned long)SubmissionQueue.totalBytes()) + " bytes\n\n");
+
+    if (files.empty()) {
+        server.sendContent("Очередь пустая. Все ответы выгружены.\n");
+    } else {
+        for (int i = 0; i < (int)files.size(); i++) {
+            String tokenEntry = "";
+            String payload = "";
+            server.sendContent("========================================\n");
+            server.sendContent("Ответ #" + String(i + 1) + "\n");
+            server.sendContent("Файл: " + files[i] + "\n");
+            if (SubmissionQueue.readQueueFile(files[i], tokenEntry, payload)) {
+                server.sendContent("Токен/опрос: " + tokenEntry + "\n\n");
+                server.sendContent(payloadToText(payload));
+                server.sendContent("\n");
+            } else {
+                server.sendContent("Файл очереди поврежден или не читается.\n\n");
+            }
+            delay(1);
+        }
+    }
+    server.sendContent("");
+}
+
+void WebUIManager::handleQueueFlush() {
+    if (!checkAuth()) { server.sendHeader("Location", "/admin"); server.send(302, "text/plain", ""); return; }
+
+    if (SubmissionQueue.count() == 0) {
+        Logger.add("Очередь ответов пустая.");
+    } else if (SubmissionQueue.flush()) {
+        Logger.add("Ручная отправка очереди завершена.");
+    } else {
+        Logger.add("Ручная отправка очереди не завершена.", "warn");
+    }
+
+    server.sendHeader("Location", "/admin");
+    server.send(302, "text/plain", "");
 }
 
 void WebUIManager::handleSaveSettings() {
@@ -476,13 +600,14 @@ void WebUIManager::handleSaveSettings() {
 
 void WebUIManager::handleUpdate() { 
     if (!checkAuth()) { server.sendHeader("Location", "/admin"); server.send(302, "text/plain", ""); return; }
-    Logger.add("Запущено ручное обновление опросников...");
-    bool ok = Forms.fetchFromServer(); 
-    if (ok) {
-        server.send(200, "text/html", "<html><body style='text-align:center; padding:50px;'><h2 style='color:#2ecc71;'>✅ Опросники обновлены!</h2><button onclick=\"window.location.href='/admin'\">Вернуться в админку</button></body></html>"); 
+    if (Forms.syncInProgress) {
+        Logger.add("РћР±РЅРѕРІР»РµРЅРёРµ РѕРїСЂРѕСЃРЅРёРєРѕРІ СѓР¶Рµ РёРґРµС‚.");
     } else {
-        server.send(200, "text/html", "<html><body style='text-align:center; padding:50px;'><h2 style='color:#e74c3c;'>❌ Опросники не загрузились</h2><p>Проверьте системный лог в админке.</p><button onclick=\"window.location.href='/admin'\">Вернуться в админку</button></body></html>"); 
+        Forms.requestSync();
+        Logger.add("Р СѓС‡РЅРѕРµ РѕР±РЅРѕРІР»РµРЅРёРµ РѕРїСЂРѕСЃРЅРёРєРѕРІ РїРѕСЃС‚Р°РІР»РµРЅРѕ РІ РѕС‡РµСЂРµРґСЊ.");
     }
+    server.sendHeader("Location", "/admin");
+    server.send(302, "text/plain", "");
 }
 
 void WebUIManager::handleReboot() {

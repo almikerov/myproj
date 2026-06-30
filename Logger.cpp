@@ -10,9 +10,13 @@ void SystemLogger::begin() {
 void SystemLogger::add(const String& msg, const String& level) {
     struct tm timeinfo;
     String timeStr = "";
-    if (getLocalTime(&timeinfo, 10) && timeinfo.tm_year > 120) {
-        char timeStringBuff[50];
-        strftime(timeStringBuff, sizeof(timeStringBuff), "[%H:%M:%S] ", &timeinfo);
+    if (getLocalTime(&timeinfo, 10) &&
+        timeinfo.tm_year > 120 &&
+        timeinfo.tm_hour >= 0 && timeinfo.tm_hour < 24 &&
+        timeinfo.tm_min >= 0 && timeinfo.tm_min < 60 &&
+        timeinfo.tm_sec >= 0 && timeinfo.tm_sec < 61) {
+        char timeStringBuff[16];
+        snprintf(timeStringBuff, sizeof(timeStringBuff), "[%02d:%02d:%02d] ", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
         timeStr = String(timeStringBuff);
     } else {
         timeStr = "[" + String(millis() / 1000) + " сек] ";

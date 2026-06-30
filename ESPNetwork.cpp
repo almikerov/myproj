@@ -18,6 +18,8 @@ void ESPNetworkManager::begin() {
     ledBlinkInterval = 500; 
     
     WiFi.mode(WIFI_AP_STA);
+    WiFi.setSleep(false);
+    WiFi.setTxPower(WIFI_POWER_11dBm);
     WiFi.begin(Config.router_ssid.c_str(), Config.router_pass.c_str());
     int tries = 0; 
     while (WiFi.status() != WL_CONNECTED && tries < 20) { 

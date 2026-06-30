@@ -88,11 +88,14 @@ async function proxyToGoogleAppsScript(request, env, url) {
     body: request.method === "GET" || request.method === "HEAD" ? undefined : await request.text(),
   });
 
+  const responseText = await response.text();
   const newHeaders = new Headers(response.headers);
   newHeaders.set("Access-Control-Allow-Origin", "*");
   newHeaders.set("Cache-Control", "no-store");
+  newHeaders.set("Content-Type", response.headers.get("Content-Type") || "text/plain; charset=utf-8");
+  newHeaders.set("Content-Length", String(new TextEncoder().encode(responseText).length));
 
-  return new Response(response.body, {
+  return new Response(responseText, {
     status: response.status,
     headers: newHeaders,
   });

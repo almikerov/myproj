@@ -21,10 +21,12 @@ private:
     void handleChangePass();
     void handleImage();
     void handleForm();
-    void handleFormBody();
     void handleSubmit();
     void handleAdmin();
     void handleProgress();
+    void handleQueueView();
+    void handleQueueDownload();
+    void handleQueueFlush();
     void handleSaveSettings();
     void handleUpdate();
     void handleReboot();

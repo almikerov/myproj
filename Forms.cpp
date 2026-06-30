@@ -10,6 +10,13 @@
 
 FormManager Forms;
 
+static const size_t MAX_FORM_HTML_CACHE_BYTES = 220 * 1024;
+
+static int countDataImages(const String& fileName, uint32_t htmlOffset);
+static bool splitEmbeddedImages(const String& fileName, int formIndex, uint32_t htmlOffset, int expectedImages, int readyCount, int totalForms);
+static void removeImagesForForm(int formIndex);
+static bool prepareCachedFormForRam(int formIndex, uint32_t htmlOffset, int readyCount, int totalForms);
+
 static int clampProgressPercent(int value) {
     if (value < 0) return 0;
     if (value > 100) return 100;
@@ -29,6 +36,10 @@ int FormManager::readyCount() const {
         if (ready) count++;
     }
     return count;
+}
+
+void FormManager::requestSync() {
+    syncRequested = true;
 }
 
 void FormManager::setProgress(const String& phase, const String& message, int form, int forms, int ready, int percent, size_t bytes, size_t totalBytes, int image, int images) {
@@ -80,8 +91,21 @@ bool FormManager::cacheFormHtml(int index) {
     }
 
     size_t expectedSize = file.size() - offset;
+    if (expectedSize > MAX_FORM_HTML_CACHE_BYTES) {
+        file.close();
+        if (countDataImages(fileName, offset) > 0 && prepareCachedFormForRam(index, offset, readyCount(), formCount)) {
+            return cacheFormHtml(index);
+        }
+        Logger.add("Form cache failed: HTML for #" + String(index + 1) + " is too large for RAM (" + String(expectedSize) + " bytes)", "error");
+        return false;
+    }
+
     String html = "";
-    html.reserve(expectedSize + 1);
+    if (!html.reserve(expectedSize + 1)) {
+        file.close();
+        Logger.add("Form cache failed: not enough RAM for #" + String(index + 1) + " (" + String(expectedSize) + " bytes)", "error");
+        return false;
+    }
     file.seek(offset);
 
     char buf[1025];
@@ -119,7 +143,7 @@ void FormManager::cacheAllReadyForms() {
             continue;
         }
 
-        if (cacheFormHtml(i)) {
+        if (prepareCachedFormForRam(i, formHtmlOffsets[i], cached, formCount) && cacheFormHtml(i)) {
             cached++;
             totalBytes += formHtmlCache[i].length();
         } else {
@@ -130,60 +154,92 @@ void FormManager::cacheAllReadyForms() {
     Logger.add("RAM form cache ready: " + String(cached) + " of " + String(formCount) + ", total " + String(totalBytes) + " bytes");
 }
 
-// Безопасный Stream для записи в LittleFS с периодической отдачей процессорного времени (delay 1),
-// чтобы не вызывать панику Watchdog Timer и не вешать систему на долгих файловых операциях.
-class SafeFileStream : public Stream {
-private:
-    File* _file;
-    size_t _bytesWritten = 0;
-    size_t _totalBytes = 0;
-    size_t _nextProgressBytes = 65536;
-    unsigned long _startedAt = 0;
-    String _label = "";
-    int _form = 0;
-    int _forms = 0;
-    int _ready = 0;
-public:
-    SafeFileStream(File* f, const String& label = "", int form = 0, int forms = 0, int ready = 0, size_t totalBytes = 0) : _file(f), _totalBytes(totalBytes), _label(label), _form(form), _forms(forms), _ready(ready) {
-        _startedAt = millis();
-    }
-    size_t write(uint8_t c) override {
-        _bytesWritten++;
-        if (_bytesWritten % 4096 == 0) {
-            delay(1);
-            reportProgress();
-        }
-        return _file->write(c);
-    }
-    size_t write(const uint8_t *buffer, size_t size) override {
-        _bytesWritten += size;
-        if (_bytesWritten % 4096 < size) delay(1);
-        esp_task_wdt_reset();
-        reportProgress();
-        return _file->write(buffer, size);
-    }
-    int available() override { return _file->available(); }
-    int read() override { return _file->read(); }
-    int peek() override { return _file->peek(); }
-    void flush() override { _file->flush(); }
-    size_t bytesWritten() const { return _bytesWritten; }
-private:
-    void reportProgress() {
-        if (_label.length() == 0 || _bytesWritten < _nextProgressBytes) return;
-        String sizePart = String(_bytesWritten / 1024) + " KB";
-        int formPercent = 10;
-        if (_totalBytes > 0) {
-            formPercent = 10 + (int)((_bytesWritten * 70ULL) / _totalBytes);
-            if (formPercent > 80) formPercent = 80;
-            sizePart += " / " + String(_totalBytes / 1024) + " KB";
-        }
-        Forms.setProgress("download", "Скачивание опроса " + String(_form) + " из " + String(_forms), _form, _forms, _ready, overallProgressPercent(_ready, _forms, formPercent), _bytesWritten, _totalBytes, 0, 0);
-        Logger.add(_label + ": " + sizePart + " in " + String((millis() - _startedAt) / 1000) + "s");
-        _nextProgressBytes += 65536;
-    }
-};
-
 static const int FORM_DOWNLOAD_TIMEOUT_MS = 60000;
+static const int FORM_DOWNLOAD_IDLE_TIMEOUT_MS = 20000;
+static const size_t FORM_DOWNLOAD_BUFFER_SIZE = 1024;
+static const size_t FORM_DOWNLOAD_PROGRESS_STEP = 32768;
+
+static String bytesToKbString(size_t bytes) {
+    return String(bytes / 1024) + " KB";
+}
+
+static void reportFormDownloadProgress(const String& label, int form, int forms, int ready, size_t bytesWritten, size_t totalBytes, unsigned long startedAt) {
+    String sizePart = bytesToKbString(bytesWritten);
+    int formPercent = 10;
+    if (totalBytes > 0) {
+        sizePart += " / " + bytesToKbString(totalBytes);
+        formPercent = 10 + (int)((bytesWritten * 70ULL) / totalBytes);
+        if (formPercent > 80) formPercent = 80;
+    }
+
+    Forms.setProgress("download", "Download form " + String(form) + " of " + String(forms), form, forms, ready, overallProgressPercent(ready, forms, formPercent), bytesWritten, totalBytes, 0, 0);
+    Logger.add(label + ": " + sizePart + " in " + String((millis() - startedAt) / 1000) + "s");
+}
+
+static bool downloadHttpBodyToFile(HTTPClient& http, File& file, const String& label, int form, int forms, int ready, size_t totalBytes, size_t& bytesWritten) {
+    WiFiClient* stream = http.getStreamPtr();
+    if (!stream) {
+        Logger.add(label + ": no HTTP stream", "error");
+        return false;
+    }
+
+    uint8_t buffer[FORM_DOWNLOAD_BUFFER_SIZE];
+    unsigned long startedAt = millis();
+    unsigned long lastDataAt = startedAt;
+    size_t nextProgressBytes = FORM_DOWNLOAD_PROGRESS_STEP;
+    bytesWritten = 0;
+
+    while (true) {
+        int availableBytes = stream->available();
+        if (availableBytes > 0) {
+            size_t toRead = (size_t)availableBytes;
+            if (toRead > sizeof(buffer)) toRead = sizeof(buffer);
+
+            int readLen = stream->readBytes(buffer, toRead);
+            if (readLen > 0) {
+                size_t written = file.write(buffer, (size_t)readLen);
+                if (written != (size_t)readLen) {
+                    Logger.add(label + ": LittleFS write failed at " + String(bytesWritten) + " bytes", "error");
+                    return false;
+                }
+
+                bytesWritten += written;
+                lastDataAt = millis();
+
+                if (bytesWritten >= nextProgressBytes) {
+                    reportFormDownloadProgress(label, form, forms, ready, bytesWritten, totalBytes, startedAt);
+                    nextProgressBytes = bytesWritten + FORM_DOWNLOAD_PROGRESS_STEP;
+                }
+
+                if (totalBytes > 0 && bytesWritten >= totalBytes) break;
+            }
+        } else {
+            if (totalBytes > 0 && bytesWritten >= totalBytes) break;
+            if (!http.connected()) {
+                if (totalBytes == 0 && bytesWritten > 0) break;
+                break;
+            }
+            if (millis() - lastDataAt > FORM_DOWNLOAD_IDLE_TIMEOUT_MS) {
+                Logger.add(label + ": download stalled after " + bytesToKbString(bytesWritten), "error");
+                return false;
+            }
+            delay(5);
+            esp_task_wdt_reset();
+        }
+    }
+
+    file.flush();
+    if (bytesWritten > 0) {
+        reportFormDownloadProgress(label, form, forms, ready, bytesWritten, totalBytes, startedAt);
+    }
+
+    if (totalBytes > 0 && bytesWritten < totalBytes) {
+        Logger.add(label + ": connection closed early, got " + String(bytesWritten) + " / " + String(totalBytes) + " bytes", "error");
+        return false;
+    }
+
+    return bytesWritten > 0;
+}
 
 static String metaPathForForm(int formIndex) {
     return "/meta_" + String(formIndex) + ".txt";
@@ -236,7 +292,13 @@ static int base64Value(char c) {
     return -1;
 }
 
-static bool writeBase64Decoded(File& out, char c, int quartet[4], int& quartetLen) {
+static bool writeDecodedByte(File& out, uint8_t value, size_t& decodedBytes) {
+    if (out.write(value) != 1) return false;
+    decodedBytes++;
+    return true;
+}
+
+static bool writeBase64Decoded(File& out, char c, int quartet[4], int& quartetLen, size_t& decodedBytes) {
     int v = base64Value(c);
     if (v == -3) return true;
     if (v == -1) return false;
@@ -247,18 +309,18 @@ static bool writeBase64Decoded(File& out, char c, int quartet[4], int& quartetLe
     if (quartet[0] < 0 || quartet[1] < 0) return false;
 
     uint8_t b0 = (quartet[0] << 2) | (quartet[1] >> 4);
-    out.write(b0);
+    if (!writeDecodedByte(out, b0, decodedBytes)) return false;
 
     if (quartet[2] != -2) {
         if (quartet[2] < 0) return false;
         uint8_t b1 = ((quartet[1] & 0x0F) << 4) | (quartet[2] >> 2);
-        out.write(b1);
+        if (!writeDecodedByte(out, b1, decodedBytes)) return false;
     }
 
     if (quartet[3] != -2) {
         if (quartet[2] < 0 || quartet[3] < 0) return false;
         uint8_t b2 = ((quartet[2] & 0x03) << 6) | quartet[3];
-        out.write(b2);
+        if (!writeDecodedByte(out, b2, decodedBytes)) return false;
     }
 
     quartetLen = 0;
@@ -270,6 +332,148 @@ static String imageExtensionForMime(const String& mime) {
     if (mime.indexOf("gif") != -1) return ".gif";
     if (mime.indexOf("webp") != -1) return ".webp";
     return ".png";
+}
+
+static void trackOutputChar(String& tail, char c) {
+    tail += c;
+    if (tail.length() > 32) {
+        tail.remove(0, tail.length() - 32);
+    }
+}
+
+static void writeTrackedChar(File& out, String& tail, char c) {
+    out.write((uint8_t)c);
+    trackOutputChar(tail, c);
+}
+
+static void writeTrackedString(File& out, String& tail, const String& value) {
+    out.print(value);
+    for (unsigned int i = 0; i < value.length(); i++) {
+        trackOutputChar(tail, value[i]);
+    }
+}
+
+static char dataUriTerminatorFromTail(const String& tail) {
+    if (tail.length() == 0) return 0;
+    char last = tail[tail.length() - 1];
+    if (last == '\'' || last == '"') return last;
+    if (last == '(') return ')';
+    return 0;
+}
+
+static bool isDataUriTerminator(char c, char terminator) {
+    if (terminator != 0) return c == terminator;
+    return c == '\'' || c == '"' || c == ')' || c == '<' || c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+static bool extractAndReplaceDataImageUri(File& in, File& out, int formIndex, int& imageIndex, char terminator, String& tail, const String& matchedPrefix, size_t expectedImages) {
+    String meta = "image/";
+    meta.reserve(64);
+    bool foundComma = false;
+    String failure = "";
+
+    while (in.available()) {
+        char c = in.read();
+        if (c == ',') {
+            foundComma = true;
+            break;
+        }
+        if (isDataUriTerminator(c, terminator) || meta.length() > 96) {
+            failure = "bad data URI header";
+            writeTrackedString(out, tail, matchedPrefix + meta);
+            writeTrackedChar(out, tail, c);
+            Logger.add("Form #" + String(formIndex + 1) + " image " + String(imageIndex + 1) + " skipped: " + failure, "warn");
+            return false;
+        }
+        meta += c;
+    }
+
+    if (!foundComma) {
+        failure = "missing base64 comma";
+        writeTrackedString(out, tail, matchedPrefix + meta);
+        Logger.add("Form #" + String(formIndex + 1) + " image " + String(imageIndex + 1) + " skipped: " + failure, "warn");
+        return false;
+    }
+
+    String metaLower = meta;
+    metaLower.toLowerCase();
+    int b64Idx = metaLower.indexOf(";base64");
+    if (b64Idx == -1) {
+        failure = "not base64";
+        writeTrackedString(out, tail, matchedPrefix + meta + ",");
+        Logger.add("Form #" + String(formIndex + 1) + " image " + String(imageIndex + 1) + " skipped: " + failure, "warn");
+        return false;
+    }
+
+    String mime = metaLower.substring(0, b64Idx);
+    String imgPath = "/img_" + String(formIndex) + "_" + String(imageIndex) + imageExtensionForMime(mime);
+    LittleFS.remove(imgPath);
+
+    File img = LittleFS.open(imgPath, FILE_WRITE);
+    if (!img) {
+        failure = "cannot open image file";
+        writeTrackedString(out, tail, "");
+        Logger.add("Form #" + String(formIndex + 1) + " image " + String(imageIndex + 1) + " skipped: " + failure, "error");
+        return false;
+    }
+
+    int quartet[4] = {0, 0, 0, 0};
+    int quartetLen = 0;
+    uint32_t b64Chars = 0;
+    bool ok = true;
+    bool ended = false;
+    char endChar = 0;
+    size_t imageSize = 0;
+
+    while (in.available()) {
+        char c = in.read();
+        if (isDataUriTerminator(c, terminator)) {
+            ended = true;
+            endChar = c;
+            break;
+        }
+
+        if (!writeBase64Decoded(img, c, quartet, quartetLen, imageSize)) {
+            ok = false;
+        }
+
+        b64Chars++;
+        if ((b64Chars & 0x0FFF) == 0) {
+            delay(1);
+            esp_task_wdt_reset();
+        }
+    }
+
+    if (ok && quartetLen == 2) {
+        if (quartet[0] >= 0 && quartet[1] >= 0) ok = writeDecodedByte(img, (uint8_t)((quartet[0] << 2) | (quartet[1] >> 4)), imageSize);
+    } else if (ok && quartetLen == 3) {
+        if (quartet[0] >= 0 && quartet[1] >= 0 && quartet[2] >= 0) {
+            ok = writeDecodedByte(img, (uint8_t)((quartet[0] << 2) | (quartet[1] >> 4)), imageSize);
+            if (ok) ok = writeDecodedByte(img, (uint8_t)(((quartet[1] & 0x0F) << 4) | (quartet[2] >> 2)), imageSize);
+        }
+    } else if (quartetLen != 0) {
+        ok = false;
+    }
+
+    img.close();
+
+    if (!ok || !ended || imageSize == 0) {
+        LittleFS.remove(imgPath);
+        writeTrackedString(out, tail, "");
+        if (ended) writeTrackedChar(out, tail, endChar);
+        if (!ok) failure = "invalid base64";
+        else if (!ended) failure = "missing URI terminator";
+        else failure = "empty image file";
+        Logger.add("Form #" + String(formIndex + 1) + " image " + String(imageIndex + 1) + " skipped: " + failure + ", chars: " + String(b64Chars), "warn");
+        return false;
+    }
+
+    writeTrackedString(out, tail, imgPath);
+    writeTrackedChar(out, tail, endChar);
+
+    imageIndex++;
+    Logger.add("Form #" + String(formIndex + 1) + " image " + String(imageIndex) + "/" + String(expectedImages) + " saved: " + String(imageSize / 1024) + " KB");
+    return true;
 }
 
 static bool flushCandidateOrRestart(File& out, String& candidate, char c, int& state) {
@@ -333,13 +537,14 @@ static bool extractDataImage(File& in, File& out, int formIndex, int& imageIndex
     int quartetLen = 0;
     uint32_t b64Chars = 0;
     bool ok = true;
+    size_t imageSize = 0;
 
     while (in.available()) {
         char c = in.read();
         if (c == quote) {
             break;
         }
-        if (!writeBase64Decoded(img, c, quartet, quartetLen)) {
+        if (!writeBase64Decoded(img, c, quartet, quartetLen, imageSize)) {
             ok = false;
         }
         b64Chars++;
@@ -350,17 +555,16 @@ static bool extractDataImage(File& in, File& out, int formIndex, int& imageIndex
     }
 
     if (ok && quartetLen == 2) {
-        if (quartet[0] >= 0 && quartet[1] >= 0) img.write((uint8_t)((quartet[0] << 2) | (quartet[1] >> 4)));
+        if (quartet[0] >= 0 && quartet[1] >= 0) ok = writeDecodedByte(img, (uint8_t)((quartet[0] << 2) | (quartet[1] >> 4)), imageSize);
     } else if (ok && quartetLen == 3) {
         if (quartet[0] >= 0 && quartet[1] >= 0 && quartet[2] >= 0) {
-            img.write((uint8_t)((quartet[0] << 2) | (quartet[1] >> 4)));
-            img.write((uint8_t)(((quartet[1] & 0x0F) << 4) | (quartet[2] >> 2)));
+            ok = writeDecodedByte(img, (uint8_t)((quartet[0] << 2) | (quartet[1] >> 4)), imageSize);
+            if (ok) ok = writeDecodedByte(img, (uint8_t)(((quartet[1] & 0x0F) << 4) | (quartet[2] >> 2)), imageSize);
         }
     } else if (quartetLen != 0) {
         ok = false;
     }
 
-    size_t imageSize = img.size();
     img.close();
 
     if (!ok || imageSize == 0) {
@@ -408,75 +612,50 @@ static bool splitEmbeddedImages(const String& fileName, int formIndex, uint32_t 
         left -= n;
     }
 
-    int state = 0;
-    int dataIdx = 0;
-    char quote = 0;
+    const char* needle = "data:image/";
+    int match = 0;
     int imageIndex = 0;
     int extracted = 0;
     String candidate = "";
     candidate.reserve(16);
-    const char* dataWord = "data:";
+    String tail = "";
+    tail.reserve(40);
     size_t totalSize = in.size();
-    uint32_t nextProgressPos = htmlOffset + 65536;
+    uint32_t nextProgressPos = htmlOffset + 32768;
 
     while (in.available()) {
         char c = in.read();
 
-        if (state == 0) {
-            if (c == 's') {
-                candidate = "s";
-                state = 1;
-            } else {
-                out.write((uint8_t)c);
+        if (c == needle[match]) {
+            candidate += c;
+            match++;
+            if (needle[match] == '\0') {
+                Forms.setProgress("images", "Обработка картинок " + String(imageIndex + 1) + " из " + String(expectedImages), formIndex + 1, totalForms, readyCount, overallProgressPercent(readyCount, totalForms, 85), in.position(), totalSize, imageIndex + 1, expectedImages);
+                char terminator = dataUriTerminatorFromTail(tail);
+                if (extractAndReplaceDataImageUri(in, out, formIndex, imageIndex, terminator, tail, candidate, expectedImages)) {
+                    extracted++;
+                }
+                candidate = "";
+                match = 0;
             }
-        } else if (state == 1) {
-            if (c == 'r') {
-                candidate += c;
-                state = 2;
-            } else {
-                flushCandidateOrRestart(out, candidate, c, state);
-            }
-        } else if (state == 2) {
-            if (c == 'c') {
-                candidate += c;
-                state = 3;
-            } else {
-                flushCandidateOrRestart(out, candidate, c, state);
-            }
-        } else if (state == 3) {
-            if (c == '=') {
-                candidate += c;
-                state = 4;
-            } else {
-                flushCandidateOrRestart(out, candidate, c, state);
-            }
-        } else if (state == 4) {
-            if (c == '\'' || c == '"') {
-                quote = c;
-                candidate += c;
-                dataIdx = 0;
-                state = 5;
-            } else {
-                flushCandidateOrRestart(out, candidate, c, state);
-            }
-        } else if (state == 5) {
-            if (c == dataWord[dataIdx]) {
-                candidate += c;
-                dataIdx++;
-                if (dataIdx == 5) {
-                    Forms.setProgress("images", "Обработка картинок " + String(imageIndex + 1) + " из " + String(expectedImages), formIndex + 1, totalForms, readyCount, overallProgressPercent(readyCount, totalForms, 85), in.position(), totalSize, imageIndex + 1, expectedImages);
-                    if (extractDataImage(in, out, formIndex, imageIndex, quote, candidate)) {
-                        extracted++;
-                    }
-                    candidate = "";
-                    state = 0;
+        } else {
+            if (match > 0) {
+                writeTrackedString(out, tail, candidate);
+                candidate = "";
+                match = 0;
+
+                if (c == needle[0]) {
+                    candidate += c;
+                    match = 1;
+                } else {
+                    writeTrackedChar(out, tail, c);
                 }
             } else {
-                flushCandidateOrRestart(out, candidate, c, state);
+                writeTrackedChar(out, tail, c);
             }
         }
 
-        if ((out.size() & 0x0FFF) == 0) {
+        if ((in.position() & 0x0FFF) == 0) {
             delay(1);
             esp_task_wdt_reset();
         }
@@ -484,11 +663,11 @@ static bool splitEmbeddedImages(const String& fileName, int formIndex, uint32_t 
             int scanPercent = totalSize > htmlOffset ? (int)(((in.position() - htmlOffset) * 100ULL) / (totalSize - htmlOffset)) : 100;
             int formPercent = 80 + (scanPercent / 5);
             Forms.setProgress("images", "Обработка картинок " + String(extracted) + " из " + String(expectedImages), formIndex + 1, totalForms, readyCount, overallProgressPercent(readyCount, totalForms, formPercent), in.position(), totalSize, extracted, expectedImages);
-            nextProgressPos += 65536;
+            nextProgressPos += 32768;
         }
     }
 
-    if (candidate.length() > 0) out.print(candidate);
+    if (candidate.length() > 0) writeTrackedString(out, tail, candidate);
 
     in.close();
     out.close();
@@ -560,6 +739,24 @@ static void removeImagesForForm(int formIndex) {
     }
 }
 
+static bool prepareCachedFormForRam(int formIndex, uint32_t htmlOffset, int readyCount, int totalForms) {
+    String fileName = "/raw_" + String(formIndex) + ".txt";
+    int dataImageCount = countDataImages(fileName, htmlOffset);
+    if (dataImageCount <= 0) return true;
+
+    Logger.add("Cached form #" + String(formIndex + 1) + " contains embedded images: " + String(dataImageCount) + ". Preparing fast cache...");
+    Forms.setProgress("images", "Preparing cached form " + String(formIndex + 1), formIndex + 1, totalForms, readyCount, overallProgressPercent(readyCount, totalForms, 82), 0, 0, 0, dataImageCount);
+
+    removeImagesForForm(formIndex);
+    bool ok = splitEmbeddedImages(fileName, formIndex, htmlOffset, dataImageCount, readyCount, totalForms);
+    if (ok) {
+        Logger.add("Cached form #" + String(formIndex + 1) + " prepared for fast opening.");
+    } else {
+        Logger.add("Cached form #" + String(formIndex + 1) + " image preparation failed.", "error");
+    }
+    return ok;
+}
+
 static String readStringUntilToken(File& file, const char* token) {
     String result = "";
     result.reserve(128); // Prevent heap fragmentation
@@ -629,7 +826,6 @@ bool FormManager::loadCachedForms() {
     formHtmlOffsets.resize(formCount, 0);
     formReady.resize(formCount, false);
     formHtmlCache.resize(formCount, "");
-    formHtmlCache.resize(formCount, "");
     formRevisions.resize(formCount, "");
     for (int i = 0; i < formCount; i++) {
         if (formTitles[i].length() == 0) formTitles[i] = "Загрузка опроса...";
@@ -670,6 +866,113 @@ bool FormManager::loadCachedForms() {
     return loaded > 0;
 }
 
+bool FormManager::checkForUpdates() {
+    lastUpdateCheckAt = millis();
+    updatesAvailable = false;
+
+    if (syncInProgress) {
+        updateStatus = "Синхронизация уже идет";
+        return false;
+    }
+
+    if (!ESPNetwork.isConnected()) {
+        updateStatus = "Нет сети для проверки версий";
+        Logger.add(updateStatus);
+        return false;
+    }
+
+    Logger.add("Проверка версий опросников...");
+
+    int remoteCount = -1;
+    {
+        WiFiClientSecure countClient;
+        countClient.setInsecure();
+        HTTPClient http;
+        http.begin(countClient, Config.cloud_url + "?action=getFormCount");
+        http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+        http.setTimeout(15000);
+        http.setReuse(false);
+        http.useHTTP10(true);
+        http.addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+
+        int code = http.GET();
+        if (code == 200) {
+            remoteCount = http.getString().toInt();
+        } else {
+            Logger.add("Не удалось проверить список опросников: HTTP " + String(code), "warn");
+        }
+        http.end();
+    }
+
+    if (remoteCount <= 0) {
+        updateStatus = "Список опросников не получен";
+        return false;
+    }
+
+    if (remoteCount != formCount) {
+        updatesAvailable = true;
+        updateStatus = "Изменилось количество опросников: " + String(formCount) + " -> " + String(remoteCount);
+        Logger.add(updateStatus, "warn");
+        return true;
+    }
+
+    bool foundUpdates = false;
+    int checked = 0;
+
+    for (int i = 0; i < remoteCount; i++) {
+        esp_task_wdt_reset();
+
+        WiFiClientSecure metaClient;
+        metaClient.setInsecure();
+        HTTPClient metaHttp;
+        metaHttp.begin(metaClient, Config.cloud_url + "?action=getFormMeta&index=" + String(i));
+        metaHttp.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+        metaHttp.setTimeout(15000);
+        metaHttp.setReuse(false);
+        metaHttp.useHTTP10(true);
+        metaHttp.addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+
+        int metaCode = metaHttp.GET();
+        if (metaCode == 200) {
+            String remoteTitle = "";
+            String remoteRevision = "";
+            int remoteMaxDaily = 1;
+            if (parseMetaPayload(metaHttp.getString(), remoteTitle, remoteMaxDaily, remoteRevision) && remoteRevision.length() > 0) {
+                String localRevision = "";
+                if (i < (int)formRevisions.size()) localRevision = formRevisions[i];
+                if (localRevision.length() == 0) readSmallFile(metaPathForForm(i), localRevision);
+
+                bool ready = i < (int)formReady.size() && formReady[i];
+                if (localRevision.length() == 0 && ready) {
+                    if (i >= (int)formRevisions.size()) formRevisions.resize(remoteCount, "");
+                    formRevisions[i] = remoteRevision;
+                    writeSmallFile(metaPathForForm(i), remoteRevision);
+                    Logger.add("Form #" + String(i + 1) + " revision metadata initialized.");
+                } else if (localRevision.length() == 0 || localRevision != remoteRevision) {
+                    foundUpdates = true;
+                    Logger.add("Form #" + String(i + 1) + " has a newer version.", "warn");
+                }
+                checked++;
+            }
+        } else {
+            Logger.add("Не удалось проверить опрос #" + String(i + 1) + ": HTTP " + String(metaCode), "warn");
+        }
+        metaHttp.end();
+        delay(20);
+    }
+
+    updatesAvailable = foundUpdates;
+    if (foundUpdates) {
+        updateStatus = "Есть новые версии опросников. Нажми обновление, когда удобно.";
+        Logger.add(updateStatus, "warn");
+    } else {
+        updateStatus = "Версии опросников актуальны. Проверено: " + String(checked) + " из " + String(remoteCount);
+        Logger.add(updateStatus);
+    }
+
+    return foundUpdates;
+}
+
 String FormManager::getLocalToken(const String& formNumber, IPAddress ip) {
     int hash = (ip[3] * 137) ^ (formNumber.toInt() * 89);
     hash = hash + 4096; 
@@ -679,9 +982,11 @@ String FormManager::getLocalToken(const String& formNumber, IPAddress ip) {
 }
 
 bool FormManager::fetchFromServer() {
+    syncInProgress = true;
     finishProgress("Проверка сети");
     if (!ESPNetwork.isConnected()) {
         Logger.add("Нет сети, пропускаем скачивание опросников.");
+        syncInProgress = false;
         return false;
     }
     Logger.add("--- НАЧАЛО: Запрос списка опросников ---");
@@ -713,6 +1018,7 @@ bool FormManager::fetchFromServer() {
     
     if (formCount <= 0) {
         finishProgress("Список опросов не получен");
+        syncInProgress = false;
         return false;
     }
 
@@ -751,6 +1057,7 @@ bool FormManager::fetchFromServer() {
     int loadedCount = readyCount();
     std::vector<int> imageForms;
     std::vector<int> imageCounts(formCount, 0);
+    std::vector<String> pendingRevisions(formCount, "");
     setProgress("start", "Проверка обновлений", 0, formCount, loadedCount, overallProgressPercent(loadedCount, formCount, 0), 0, 0, 0, 0);
     for (int i = 0; i < formCount; i++) {
         esp_task_wdt_reset();
@@ -791,12 +1098,33 @@ bool FormManager::fetchFromServer() {
                     shouldDownload = false;
                     if (!formReady[i]) loadedCount++;
                     formReady[i] = true;
+                    if (!prepareCachedFormForRam(i, formHtmlOffsets[i], loadedCount, formCount) || !cacheFormHtml(i)) {
+                        formReady[i] = false;
+                        if (loadedCount > 0) loadedCount--;
+                    }
                     setProgress("cache", "Опрос " + String(i + 1) + " из " + String(formCount) + ": без изменений", i + 1, formCount, loadedCount, overallProgressPercent(loadedCount, formCount, 100), 0, 0, 0, 0);
                     Logger.add("Form #" + String(i + 1) + " unchanged, using cache.");
+                } else if (hasPublishedCache && formReady[i] && formRevisions[i].length() == 0 && remoteRevision.length() > 0) {
+                    bool cacheOk = prepareCachedFormForRam(i, formHtmlOffsets[i], loadedCount, formCount) && cacheFormHtml(i);
+                    if (cacheOk) {
+                        shouldDownload = false;
+                        formRevisions[i] = remoteRevision;
+                        writeSmallFile(metaPathForForm(i), remoteRevision);
+                        setProgress("cache", "Опрос " + String(i + 1) + " из " + String(formCount) + ": кэш принят", i + 1, formCount, loadedCount, overallProgressPercent(loadedCount, formCount, 100), 0, 0, 0, 0);
+                        Logger.add("Form #" + String(i + 1) + " existing cache adopted with remote revision.");
+                    } else {
+                        formReady[i] = false;
+                        if (loadedCount > 0) loadedCount--;
+                    }
                 } else if (remoteRevision.length() > 0) {
-                    if (formReady[i] && loadedCount > 0) loadedCount--;
-                    formReady[i] = false;
-                    formRevisions[i] = remoteRevision;
+                    if (!hasPublishedCache || !formReady[i]) {
+                        if (formReady[i] && loadedCount > 0) loadedCount--;
+                        formReady[i] = false;
+                        if (i < (int)formHtmlCache.size()) formHtmlCache[i] = "";
+                    } else {
+                        Logger.add("Form #" + String(i + 1) + " update is available; current cache stays active until download succeeds.");
+                    }
+                    pendingRevisions[i] = remoteRevision;
                 }
             }
         }
@@ -833,14 +1161,12 @@ bool FormManager::fetchFromServer() {
             LittleFS.remove(fileName);
             File file = LittleFS.open(fileName, FILE_WRITE);
             if (file) {
-                // writeToStream нативно парсит chunked-ответы, а SafeFileStream не дает зависнуть Watchdog'у
-                SafeFileStream safeStream(&file, "Downloading form #" + String(i + 1), i + 1, formCount, loadedCount, totalBytes);
-                int writtenResult = formHttp.writeToStream(&safeStream);
-                size_t bytesWritten = safeStream.bytesWritten();
+                size_t bytesWritten = 0;
+                bool downloadOk = downloadHttpBodyToFile(formHttp, file, "Downloading form #" + String(i + 1), i + 1, formCount, loadedCount, totalBytes, bytesWritten);
                 file.close();
 
-                if (writtenResult < 0 || bytesWritten == 0) {
-                    Logger.add("Empty or interrupted form file #" + String(i + 1), "error");
+                if (!downloadOk || bytesWritten == 0 || (totalBytes > 0 && bytesWritten < totalBytes)) {
+                    Logger.add("Empty or interrupted form file #" + String(i + 1) + ". Bytes: " + String(bytesWritten) + " / " + String(totalBytes), "error");
                     LittleFS.remove(fileName);
                     formHttp.end();
                     delay(250);
@@ -885,7 +1211,12 @@ bool FormManager::fetchFromServer() {
                         if (LittleFS.rename(fileName, finalName)) {
                             if (!formReady[i]) loadedCount++;
                             formReady[i] = true;
+                            if (pendingRevisions[i].length() > 0) formRevisions[i] = pendingRevisions[i];
                             writeSmallFile(metaPathForForm(i), formRevisions[i]);
+                            if (!cacheFormHtml(i)) {
+                                formReady[i] = false;
+                                if (loadedCount > 0) loadedCount--;
+                            }
                             setProgress("ready", "Опрос " + String(i + 1) + " из " + String(formCount) + " готов", i + 1, formCount, loadedCount, overallProgressPercent(loadedCount, formCount, 100), bytesWritten, bytesWritten, 0, 0);
                             Logger.add("✅ Опрос [" + title + "] загружен! Bytes: " + String(bytesWritten) + ", ms: " + String(millis() - formStartMs));
                         } else {
@@ -917,7 +1248,12 @@ bool FormManager::fetchFromServer() {
             if (LittleFS.rename(tmpName, finalName)) {
                 if (!formReady[idx]) loadedCount++;
                 formReady[idx] = true;
+                if (idx < (int)pendingRevisions.size() && pendingRevisions[idx].length() > 0) formRevisions[idx] = pendingRevisions[idx];
                 writeSmallFile(metaPathForForm(idx), formRevisions[idx]);
+                if (!cacheFormHtml(idx)) {
+                    formReady[idx] = false;
+                    if (loadedCount > 0) loadedCount--;
+                }
                 setProgress("ready", "Опрос " + String(idx + 1) + " из " + String(formCount) + " готов", idx + 1, formCount, loadedCount, overallProgressPercent(loadedCount, formCount, 100), 0, 0, imageCounts[idx], imageCounts[idx]);
                 Logger.add("Image form #" + String(idx + 1) + " is ready in " + String(millis() - processStartMs) + " ms.");
             } else {
@@ -933,6 +1269,7 @@ bool FormManager::fetchFromServer() {
     Logger.add("Загружено опросников: " + String(loadedCount) + " из " + String(formCount));
     Logger.add("--- КОНЕЦ: Обновление опросников ---");
     finishProgress("Готово: " + String(loadedCount) + " из " + String(formCount));
+    syncInProgress = false;
     return loadedCount > 0;
 }
 

@@ -10,7 +10,12 @@ $ProjectRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Pa
 $ArduinoCli = Join-Path $ProjectRoot "tools\arduino-cli\arduino-cli.exe"
 $ArduinoConfig = Join-Path $ProjectRoot "arduino-cli.yaml"
 $SafeFqbn = $Fqbn -replace "[:/\\=,]", "_"
-$BuildPath = Join-Path $ProjectRoot ".arduino\build\$SafeFqbn"
+$LocalCacheRoot = if (![string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+    Join-Path $env:LOCALAPPDATA "esp32-cloud-control\arduino"
+} else {
+    Join-Path $ProjectRoot ".arduino-out"
+}
+$BuildPath = Join-Path $LocalCacheRoot "build\$SafeFqbn"
 
 if (!(Test-Path -LiteralPath $ArduinoCli) -or !(Test-Path -LiteralPath $ArduinoConfig)) {
     & (Join-Path $ProjectRoot "scripts\setup-arduino.ps1") -Fqbn $Fqbn

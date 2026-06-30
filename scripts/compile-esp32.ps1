@@ -8,8 +8,12 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $ArduinoCli = Join-Path $ProjectRoot "tools\arduino-cli\arduino-cli.exe"
 $ArduinoConfig = Join-Path $ProjectRoot "arduino-cli.yaml"
-$BuildRoot = Join-Path $ProjectRoot ".arduino\build"
-$BuildCache = Join-Path $ProjectRoot ".arduino\build-cache"
+$LocalCacheRoot = if (![string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+    Join-Path $env:LOCALAPPDATA "esp32-cloud-control\arduino"
+} else {
+    Join-Path $ProjectRoot ".arduino-out"
+}
+$BuildRoot = Join-Path $LocalCacheRoot "build"
 $CtagsPath = Join-Path $ProjectRoot "tools\ctags"
 $SafeFqbn = $Fqbn -replace "[:/\\=,]", "_"
 $BuildPath = Join-Path $BuildRoot $SafeFqbn
@@ -26,10 +30,6 @@ if ($Clean -and (Test-Path -LiteralPath $BuildPath)) {
 
 if (!(Test-Path -LiteralPath $BuildPath)) {
     New-Item -ItemType Directory -Path $BuildPath | Out-Null
-}
-
-if (!(Test-Path -LiteralPath $BuildCache)) {
-    New-Item -ItemType Directory -Path $BuildCache | Out-Null
 }
 
 Write-Host "Compiling ESP32 firmware..." -ForegroundColor Cyan

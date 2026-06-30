@@ -26,10 +26,17 @@ public:
     int progressImage = 0;
     int progressImages = 0;
     unsigned long progressUpdatedAt = 0;
+    volatile bool syncRequested = false;
+    volatile bool syncInProgress = false;
+    bool updatesAvailable = false;
+    String updateStatus = "";
+    unsigned long lastUpdateCheckAt = 0;
 
     void begin();
     bool loadCachedForms();
     bool fetchFromServer();
+    bool checkForUpdates();
+    void requestSync();
     bool cacheFormHtml(int index);
     void cacheAllReadyForms();
     int readyCount() const;

@@ -4,10 +4,14 @@
 #include "Logger.h"
 #include "ESPNetwork.h"
 #include "Forms.h"
+#include "SubmissionQueue.h"
 #include "WebUI.h"
 #include "Cloud.h"
 
 #define WDT_TIMEOUT 300 // 5 minutes
+static const unsigned long FORM_VERSION_FIRST_CHECK_DELAY_MS = 60000UL;
+static const unsigned long FORM_VERSION_CHECK_INTERVAL_MS = 15UL * 60UL * 1000UL;
+static const unsigned long ANSWER_QUEUE_FLUSH_INTERVAL_MS = 15000UL;
 
 // Hardware pins
 const int BOOT_BUTTON_PIN = 0; 
@@ -29,16 +33,42 @@ void backgroundNetworkTask(void *parameter) {
     // успел обработать первые запросы устройств
     vTaskDelay(8000 / portTICK_PERIOD_MS);
     
-    Logger.add("Фоновый поток: загружаем опросники...");
-    bool formsLoaded = Forms.fetchFromServer();
-    if (formsLoaded) {
-        Logger.add("Фоновый поток: опросники загружены.");
+    if (Forms.formCount > 0 && Forms.readyCount() >= Forms.formCount) {
+        Logger.add("Фоновый поток: готовый кэш опросников найден, стартовая загрузка не нужна.");
     } else {
-        Logger.add("Фоновый поток: опросники не загружены.", "error");
+        Logger.add("Фоновый поток: загружаем опросники...");
+        bool formsLoaded = Forms.fetchFromServer();
+        if (formsLoaded) {
+            Logger.add("Фоновый поток: опросники загружены.");
+        } else {
+            Logger.add("Фоновый поток: опросники не загружены.", "error");
+        }
     }
+
+    unsigned long nextFormVersionCheckAt = millis() + FORM_VERSION_FIRST_CHECK_DELAY_MS;
+    unsigned long nextAnswerQueueFlushAt = millis() + 5000UL;
 
     // Бесконечный цикл облачных операций
     while (true) {
+        if (Forms.syncRequested && !Forms.syncInProgress) {
+            Forms.syncRequested = false;
+            Logger.add("Manual form sync requested.");
+            bool manualFormsLoaded = Forms.fetchFromServer();
+            Logger.add(manualFormsLoaded ? "Manual form sync completed." : "Manual form sync failed.", manualFormsLoaded ? "info" : "error");
+        }
+
+        if (!Forms.syncInProgress && (long)(millis() - nextFormVersionCheckAt) >= 0) {
+            nextFormVersionCheckAt = millis() + FORM_VERSION_CHECK_INTERVAL_MS;
+            Forms.checkForUpdates();
+        }
+
+        if ((long)(millis() - nextAnswerQueueFlushAt) >= 0) {
+            nextAnswerQueueFlushAt = millis() + ANSWER_QUEUE_FLUSH_INTERVAL_MS;
+            if (SubmissionQueue.count() > 0) {
+                SubmissionQueue.flush();
+            }
+        }
+
         Cloud.loop();
         vTaskDelay(500 / portTICK_PERIOD_MS); // Пауза 0.5с между итерациями
     }
@@ -69,6 +99,7 @@ void setup() {
 
     Config.begin();
     Forms.begin();
+    SubmissionQueue.begin();
     ESPNetwork.begin();
     WebUI.begin();             // Веб-сервер стартует СРАЗУ после сети
     Cloud.begin("0.1.0");
